@@ -14,6 +14,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+import re
 
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
@@ -22,6 +23,12 @@ import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "backups"))
+FERNET_KEY_PATH = Path(
+    os.getenv("FERNET_KEY_PATH", str(Path.home() / ".config" / "arb" / "fernet.key"))
+)
+CONFIG_LOCK = asyncio.Lock()
 
 CONFIG: Dict[str, Dict[str, Any]] = {
     "bybit": {"spot_pairs": [], "futures_pairs": [], "api_key": "", "api_secret": ""},
@@ -36,7 +43,8 @@ def _parse_list(value: str | None) -> List[str]:
     try:
         parsed = ast.literal_eval(value)
         if isinstance(parsed, list):
-            return [str(p) for p in parsed]
+            unique_pairs = list(dict.fromkeys(str(p) for p in parsed))
+            return unique_pairs
     except (SyntaxError, ValueError) as exc:  # pragma: no cover
         logger.error("Failed to parse list '%s': %s", value, exc)
     return []
@@ -97,8 +105,23 @@ def get_pair_mapping(exchange: str) -> Dict[str, str]:
 
 
 def get_basis_thresholds(pair: str, exchange: str) -> Tuple[float, float]:
-    del exchange  # exchange included for API compatibility
-    return BASIS_THRESHOLDS.get(pair, (0.0, 0.0))
+    """Get basis thresholds for a trading pair.
+
+    Args:
+        pair: Trading pair (e.g., 'BTC/USDT').
+        exchange: Exchange name (included for API compatibility, not used).
+
+    Returns:
+        Tuple of (open_threshold, close_threshold).
+    """
+    del exchange
+    thresholds = BASIS_THRESHOLDS.get(pair)
+    if thresholds is None:
+        logger.warning(
+            "No thresholds found for pair %s, using default (0.0, 0.0)", pair
+        )
+        return (0.0, 0.0)
+    return thresholds
 
 
 def encrypt_api_keys(keys: Dict[str, str]) -> bytes:
@@ -106,17 +129,15 @@ def encrypt_api_keys(keys: Dict[str, str]) -> bytes:
     key = Fernet.generate_key()
     fernet = Fernet(key)
     encrypted = fernet.encrypt(data)
-    backup_dir = Path("backups")
-    backup_dir.mkdir(exist_ok=True)
-    (backup_dir / "fernet.key").write_bytes(key)
+    FERNET_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    FERNET_KEY_PATH.write_bytes(key)
     return encrypted
 
 
 def decrypt_api_keys(encrypted: bytes) -> Dict[str, str]:
-    key_path = Path("backups") / "fernet.key"
-    if not key_path.exists():
-        raise FileNotFoundError("fernet.key not found in backups/")
-    key = key_path.read_bytes()
+    if not FERNET_KEY_PATH.exists():
+        raise FileNotFoundError(f"fernet.key not found at {FERNET_KEY_PATH}")
+    key = FERNET_KEY_PATH.read_bytes()
     fernet = Fernet(key)
     decrypted = fernet.decrypt(encrypted)
     return json.loads(decrypted.decode())
@@ -127,10 +148,9 @@ async def save_config_backup() -> None:
     if not env_path.exists():
         logger.error(".env file not found for backup")
         return
-    backup_dir = Path("backups")
-    backup_dir.mkdir(exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
-    backup_path = backup_dir / f".env.backup.{ts}"
+    backup_path = BACKUP_DIR / f".env.backup.{ts}"
     data = await asyncio.to_thread(env_path.read_bytes)
     await asyncio.to_thread(backup_path.write_bytes, data)
 
@@ -156,24 +176,26 @@ def validate_config() -> bool:
     if len(CONFIG["okx"]["spot_pairs"]) != len(CONFIG["okx"]["futures_pairs"]):
         logger.error("OKX spot/futures pair count mismatch")
         return False
+    pattern = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+$")
     for pair in CONFIG["okx"]["futures_pairs"]:
-        if "-" not in pair:
-            logger.error("OKX futures pair missing '-': %s", pair)
+        if not pattern.match(pair):
+            logger.error("Invalid OKX futures pair format: %s", pair)
             return False
     return True
 
 
 async def update_config(new_settings: Dict[str, str]) -> None:
     env_path = Path(".env")
-    if env_path.exists():
-        content = await asyncio.to_thread(env_path.read_text)
-        lines = [line for line in content.splitlines() if "=" in line]
-        current = dict(line.split("=", 1) for line in lines)
-    else:
-        current = {}
-    current.update(new_settings)
-    text = "\n".join(f"{k}={v}" for k, v in current.items())
-    await asyncio.to_thread(env_path.write_text, text)
+    async with CONFIG_LOCK:
+        if env_path.exists():
+            content = await asyncio.to_thread(env_path.read_text)
+            lines = [line for line in content.splitlines() if "=" in line]
+            current = dict(line.split("=", 1) for line in lines)
+        else:
+            current = {}
+        current.update(new_settings)
+        text = "\n".join(f"{k}={v}" for k, v in current.items())
+        await asyncio.to_thread(env_path.write_text, text)
 
 
 if __name__ == "__main__":  # pragma: no cover
