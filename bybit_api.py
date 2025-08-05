@@ -53,6 +53,11 @@ async def connect_api(api_key: str, api_secret: str) -> None:
     })
     try:
         await _client.load_markets()
+        # Warm up configuration helpers so they are cached in memory and
+        # readily available for later calls without extra disk I/O.
+        config.get_spot_pairs()
+        config.get_futures_pairs()
+        config.get_pair_mapping()
         await logger.log_info("Connected to Bybit API")
     except Exception as exc:
         await handle_api_error(exc)
@@ -123,7 +128,7 @@ async def get_historical_data(
                     }
                 )
             if not results:
-                await logger.log_warning("No historical data for %s", symbol)
+                await logger.log_warning(f"No historical data for {symbol}")
             return results
         except Exception as exc:
             if attempt == 3:
@@ -154,7 +159,7 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
 
     mapping = config.get_pair_mapping()
     if mapping.get(spot_symbol) != futures_symbol:
-        await logger.log_warning("Pair mapping mismatch for %s", spot_symbol)
+        await logger.log_warning(f"Pair mapping mismatch for {spot_symbol}")
 
     for attempt in range(1, 4):
         try:
