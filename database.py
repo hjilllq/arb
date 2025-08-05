@@ -12,7 +12,6 @@ import os
 import shutil
 import gzip
 import random
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -49,7 +48,6 @@ except Exception:  # pragma: no cover - fallback
 # ---------------------------------------------------------------------------
 _DB_PATH = Path("data/trades.db")
 _BACKUP_DIR = Path("backups")
-_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 # Connection stored globally after :func:`connect_db` runs.
 _DB_CONN: Optional[aiosqlite.Connection] = None
@@ -363,10 +361,10 @@ async def backup_database(compress: bool = True) -> None:
     logger.info("Database size %.2f MB", size_mb)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     backup_file = _BACKUP_DIR / f"trades.db.{timestamp}.bak"
-    loop = asyncio.get_running_loop()
 
-    def _copy(src: Path, dst: Path) -> None:
-        if compress:
+    def _copy(src: Path, dst: Path, do_compress: bool) -> None:
+        """Run the expensive file copy in a background thread."""
+        if do_compress:
             with open(src, "rb") as fsrc, gzip.open(dst, "wb") as fdst:
                 shutil.copyfileobj(fsrc, fdst)
         else:
@@ -375,9 +373,9 @@ async def backup_database(compress: bool = True) -> None:
     try:
         if compress:
             backup_file = backup_file.with_suffix(backup_file.suffix + ".gz")
-        await loop.run_in_executor(_EXECUTOR, _copy, _DB_PATH, backup_file)
+        await asyncio.to_thread(_copy, _DB_PATH, backup_file, compress)
         logger.info("Database backup created at %s", backup_file)
-        await loop.run_in_executor(_EXECUTOR, _cleanup_old_backups)
+        await asyncio.to_thread(_cleanup_old_backups)
     except Exception as exc:
         logger.error("Database backup failed: %s", exc)
         await notify("Database backup failed", str(exc))
