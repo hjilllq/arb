@@ -150,16 +150,12 @@ def _maybe_encrypt(message: str) -> str:
 
 
 def _log_shutdown() -> None:
-    """Record a final message when the application exits."""
-    try:
-        _logger.info("Logger shutting down")
-        for handler in _logger.handlers:
-            try:
-                handler.flush()
-            except Exception:
-                pass
-    except Exception:
-        pass
+    """Flush handlers quietly during interpreter shutdown."""
+    for handler in _logger.handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
 
 
 atexit.register(_log_shutdown)
@@ -173,7 +169,16 @@ async def _log_with_retry(func, msg: str, retries: int = 3) -> None:
     loop = asyncio.get_running_loop()
     for attempt in range(retries + 1):
         try:
-            await loop.run_in_executor(_EXECUTOR, func, msg)
+            def _write() -> None:
+                """Write message and flush all handlers."""
+                func(msg)
+                for handler in _logger.handlers:
+                    try:
+                        handler.flush()
+                    except Exception:
+                        pass
+
+            await loop.run_in_executor(_EXECUTOR, _write)
             return
         except Exception as exc:  # pragma: no cover - disk full or permission
             if attempt < retries:
