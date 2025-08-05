@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 
+import asyncio
 import pytest
 import pytest_asyncio
 
@@ -103,3 +104,72 @@ def test_validate_data_rejects_negative():
         }
     ]
     assert database.validate_data(bad) is False
+
+
+def test_validate_data_rejects_bad_symbols():
+    bad = [
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "spot_symbol": "BTCUSDT",  # missing slash
+            "futures_symbol": "BTC/USDT",  # contains slash
+            "spot_bid": 1,
+            "futures_ask": 2,
+        }
+    ]
+    assert database.validate_data(bad) is False
+
+
+@pytest.mark.asyncio
+async def test_parallel_query_respects_limit(temp_db, monkeypatch):
+    db_path, _ = temp_db
+    start = datetime.utcnow() - timedelta(days=120)
+    rows = [
+        {
+            "timestamp": (start + timedelta(days=30 * i)).isoformat(),
+            "spot_symbol": "BTC/USDT",
+            "futures_symbol": "BTCUSDT",
+            "spot_bid": 1 + i,
+            "futures_ask": 2 + i,
+        }
+        for i in range(4)
+    ]
+    await database.save_data(rows)
+
+    sem = asyncio.Semaphore(1)
+    monkeypatch.setattr(database, "_QUERY_SEMAPHORE", sem)
+
+    active = {"current": 0, "max": 0}
+
+    orig_connect = database.aiosqlite.connect
+
+    def tracked_connect(*args, **kwargs):
+        cm = orig_connect(*args, **kwargs)
+
+        class Wrapper:
+            async def __aenter__(self):
+                active["current"] += 1
+                active["max"] = max(active["max"], active["current"])
+                await asyncio.sleep(0.05)
+                self.conn = await cm.__aenter__()
+                return self.conn
+
+            async def __aexit__(self, exc_type, exc, tb):
+                try:
+                    return await cm.__aexit__(exc_type, exc, tb)
+                finally:
+                    active["current"] -= 1
+
+        return Wrapper()
+
+    monkeypatch.setattr(database.aiosqlite, "connect", tracked_connect)
+
+    await database.query_data(
+        "BTC/USDT",
+        "BTCUSDT",
+        rows[0]["timestamp"],
+        (start + timedelta(days=120)).isoformat(),
+        parallel=True,
+        chunk_days=30,
+    )
+
+    assert active["max"] <= 1

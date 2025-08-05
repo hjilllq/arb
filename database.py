@@ -12,6 +12,7 @@ import os
 import shutil
 import gzip
 import random
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -51,6 +52,13 @@ _BACKUP_DIR = Path("backups")
 
 # Connection stored globally after :func:`connect_db` runs.
 _DB_CONN: Optional[aiosqlite.Connection] = None
+
+# Limit concurrent query connections so SQLite isn't overwhelmed.
+_QUERY_SEMAPHORE = asyncio.Semaphore(5)
+
+# Regular expressions to verify symbol formats.
+_SPOT_RE = re.compile(r"^[A-Z0-9]+/[A-Z0-9]+$")
+_FUTURES_RE = re.compile(r"^[A-Z0-9]+$")
 
 
 async def _get_conn() -> aiosqlite.Connection:
@@ -244,13 +252,16 @@ async def query_data(
     max_funding: Optional[float] = None,
     parallel: bool = False,
     chunk_days: int = 30,
+    max_concurrency: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Return records for a pair between two dates.
 
     Optional filters narrow results by quantity and funding rate.  Setting
     ``parallel=True`` splits the date range into ``chunk_days`` segments and
-    queries them concurrently using separate connections.  This speeds up large
-    reads when the table grows big.
+    queries them concurrently using separate connections.  ``max_concurrency``
+    limits how many of those chunks run at once so SQLite isn't overwhelmed.
+    This speeds up large reads when the table grows big while keeping resource
+    usage in check.
     """
 
     base_query = (
@@ -282,22 +293,25 @@ async def query_data(
     if max_funding is not None:
         filter_clause += " AND funding_rate <= ?"
 
+    sem = _QUERY_SEMAPHORE if max_concurrency is None else asyncio.Semaphore(max_concurrency)
+
     async def _run_chunk(start: str, end: str) -> List[Dict[str, Any]]:
-        try:
-            async with aiosqlite.connect(str(_DB_PATH)) as conn:
-                query = base_query + filter_clause + " ORDER BY timestamp"
-                cursor = await conn.execute(query, _build_params(start, end))
-                rows = await cursor.fetchall()
-                cols = [c[0] for c in cursor.description]
-                df = pd.DataFrame(rows, columns=cols)
-                return df.to_dict("records")
-        except Exception as exc:
-            logger.error("Parallel query chunk failed: %s", exc)
+        async with sem:
             try:
-                await notify("Database query failed", str(exc))
-            except Exception:
-                pass
-            return []
+                async with aiosqlite.connect(str(_DB_PATH)) as conn:
+                    query = base_query + filter_clause + " ORDER BY timestamp"
+                    cursor = await conn.execute(query, _build_params(start, end))
+                    rows = await cursor.fetchall()
+                    cols = [c[0] for c in cursor.description]
+                    df = pd.DataFrame(rows, columns=cols)
+                    return df.to_dict("records")
+            except Exception as exc:
+                logger.error("Parallel query chunk failed: %s", exc)
+                try:
+                    await notify("Database query failed", str(exc))
+                except Exception:
+                    pass
+                return []
 
     if not parallel:
         conn = await _get_conn()
@@ -419,6 +433,8 @@ def validate_data(data: Iterable[Dict[str, Any]]) -> bool:
                 raise ValueError(f"missing keys: {required - set(item)}")
             if float(item["spot_bid"]) <= 0 or float(item["futures_ask"]) <= 0:
                 raise ValueError("prices must be positive")
+            if not (_SPOT_RE.match(str(item["spot_symbol"])) and _FUTURES_RE.match(str(item["futures_symbol"]))):
+                raise ValueError("bad symbol format")
     except Exception as exc:
         logger.error("Invalid data: %s", exc)
         try:
