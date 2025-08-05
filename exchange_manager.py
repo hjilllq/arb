@@ -35,7 +35,13 @@ _last_health: Dict[str, float] = {}
 _MARKET_CACHE: Dict[str, tuple[float, Dict]] = {}
 # Track long outages so we don't spam alerts every check
 _OUTAGE_THRESHOLD = 1800  # seconds (30 minutes)
+# Remember when outages were last reported to allow periodic reminders
 _OUTAGE_REPORTED: set[str] = set()
+_OUTAGE_ALERT_INTERVAL = 3600  # seconds (1 hour between outage alerts)
+_LAST_OUTAGE_ALERT: Dict[str, float] = {}
+# Count consecutive health check failures per exchange
+_FAIL_COUNTS: Dict[str, int] = {}
+_MAX_FAILURES = 5  # consecutive failures before extra notification
 
 # Helper mapping from logical names to config keys for API credentials.
 _KEY_MAP = {
@@ -231,19 +237,31 @@ async def check_exchange_health(exchange_name: str) -> bool:
     """Ping an exchange to see if it is alive.
 
     A simple ``fetch_time`` is used because it is lightweight and counts toward
-    neither balances nor trading.  On failure the function logs the issue and
-    may trigger a switch to the backup exchange if Bybit is sleepy for more
-    than five minutes.
+    neither balances nor trading.  On failure the function increments a
+    per-exchange counter, notifies operators after several consecutive errors,
+    and may trigger a switch to the backup exchange if Bybit is sleepy for more
+    than five minutes.  Exchanges offline for a long time keep sending periodic
+    outage alerts so administrators do not miss a lingering problem.
     """
 
     name = exchange_name.lower()
+    now = time.time()
     client = _EXCHANGES.get(name)
     if client is None:
+        # Even if removed, keep reminding operators about persistent outages
+        last = _last_health.get(name, 0)
+        if now - last > _OUTAGE_THRESHOLD:
+            last_alert = _LAST_OUTAGE_ALERT.get(name, 0)
+            if now - last_alert > _OUTAGE_ALERT_INTERVAL:
+                _LAST_OUTAGE_ALERT[name] = now
+                logger.critical("Exchange %s still offline", name)
+                await notify("Exchange outage", name)
         logger.error("Exchange %s not registered", name)
         return False
     try:
         await asyncio.wait_for(client.fetch_time(), timeout=10)
-        _last_health[name] = time.time()
+        _last_health[name] = now
+        _FAIL_COUNTS[name] = 0
         if name in _OUTAGE_REPORTED:
             _OUTAGE_REPORTED.discard(name)
         logger.debug("Exchange %s healthy", name)
@@ -251,14 +269,25 @@ async def check_exchange_health(exchange_name: str) -> bool:
     except Exception as exc:
         logger.warning("Health check failed for %s: %s", name, exc)
         await notify("Exchange health failed", f"{name}: {exc}")
+        failures = _FAIL_COUNTS.get(name, 0) + 1
+        _FAIL_COUNTS[name] = failures
+        if failures >= _MAX_FAILURES:
+            logger.error("%s failed %d health checks", name, failures)
+            await notify("Repeated health failures", f"{name} x{failures}")
+            _FAIL_COUNTS[name] = 0
         last = _last_health.get(name, 0)
-        now = time.time()
         if name == "bybit" and now - last > 300:
             await switch_to_backup_exchange()
-        if now - last > _OUTAGE_THRESHOLD and name not in _OUTAGE_REPORTED:
-            _OUTAGE_REPORTED.add(name)
-            logger.critical("Exchange %s outage detected", name)
-            await notify("Exchange outage", name)
+        if now - last > _OUTAGE_THRESHOLD:
+            last_alert = _LAST_OUTAGE_ALERT.get(name, 0)
+            if now - last_alert > _OUTAGE_ALERT_INTERVAL:
+                _LAST_OUTAGE_ALERT[name] = now
+                if name not in _OUTAGE_REPORTED:
+                    _OUTAGE_REPORTED.add(name)
+                    logger.critical("Exchange %s outage detected", name)
+                else:
+                    logger.critical("Exchange %s outage persists", name)
+                await notify("Exchange outage", name)
             await remove_exchange(name)
         return False
 
@@ -281,7 +310,7 @@ async def remove_exchange(exchange_name: str) -> None:
         except Exception:
             pass
     _MARKET_CACHE.pop(name, None)
-    _last_health.pop(name, None)
+    # keep _last_health so we can continue to report how long the venue has been offline
     global _active_exchange
     if _active_exchange == name:
         _active_exchange = None
