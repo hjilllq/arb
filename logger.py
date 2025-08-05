@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from logging.handlers import MemoryHandler, RotatingFileHandler
 import os
 import random
 import shutil
@@ -178,6 +179,16 @@ async def _log_with_retry(func, msg: str, retries: int = 3) -> None:
             if attempt < retries:
                 await asyncio.sleep(random.uniform(0.1, 0.5))
                 continue
+            fallback = _LOG_FILE.with_suffix(_LOG_FILE.suffix + ".fallback")
+            timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                def _write_fallback() -> None:
+                    with fallback.open("a", encoding="utf-8") as f:
+                        f.write(f"{timestamp} | {msg}\n")
+
+                await loop.run_in_executor(_EXECUTOR, _write_fallback)
+            except Exception:
+                pass
             try:
                 await notify("Log write failed", f"{exc}")
             except Exception:
@@ -203,6 +214,10 @@ def get_logger(name: str) -> logging.Logger:
 def setup_logger(log_file: str = "bot.log") -> None:
     """Configure logging to file and console.
 
+    A ``RotatingFileHandler`` splits the main log into numbered pieces while a
+    ``MemoryHandler`` buffers records and flushes them in batches.  This keeps
+    disk writes light and slightly more transactional.
+
     Parameters
     ----------
     log_file:
@@ -218,7 +233,9 @@ def setup_logger(log_file: str = "bot.log") -> None:
     # Clear existing handlers to avoid duplicate logs when reconfiguring.
     _logger.handlers.clear()
 
-    file_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        _LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8"
+    )
     console_handler = logging.StreamHandler()
 
     fmt = logging.Formatter(
@@ -228,7 +245,9 @@ def setup_logger(log_file: str = "bot.log") -> None:
     file_handler.setFormatter(fmt)
     console_handler.setFormatter(fmt)
 
-    _logger.addHandler(file_handler)
+    memory_handler = MemoryHandler(capacity=50, flushLevel=logging.ERROR, target=file_handler)
+
+    _logger.addHandler(memory_handler)
     _logger.addHandler(console_handler)
     _logger.propagate = False
 
@@ -353,7 +372,9 @@ async def archive_logs() -> None:
     except Exception as exc:  # pragma: no cover - disk errors
         await notify("Archive failed", str(exc))
     else:
-        await log_info(f"Log file successfully archived to {archive_file}")
+        await log_info(
+            f"Log file archived at {datetime.utcnow().isoformat()} to {archive_file}"
+        )
         await loop.run_in_executor(_EXECUTOR, _cleanup_old_archives)
 
 
@@ -383,7 +404,9 @@ async def clear_logs(max_size_mb: int = 100) -> None:
             with _LOG_FILE.open("w", encoding="utf-8"):
                 pass
         await loop.run_in_executor(_EXECUTOR, _truncate)
-        await log_info("Log file cleared after exceeding size limit")
+        await log_info(
+            f"Log file cleared at {datetime.utcnow().isoformat()} after exceeding size limit"
+        )
     except OSError as exc:  # pragma: no cover - disk errors
         await notify("Clear logs failed", str(exc))
 
