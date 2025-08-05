@@ -15,7 +15,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import aiosqlite
 import pandas as pd
@@ -58,7 +58,13 @@ _DB_CONN: Optional[aiosqlite.Connection] = None
 
 
 async def _get_conn() -> aiosqlite.Connection:
-    """Return an active connection, reconnecting if necessary."""
+    """Return an active connection, reconnecting if needed.
+
+    The function acts like a caretaker that checks if the door to our sticker
+    album (the database) is still open. If the door jams or someone slams it
+    shut, we quietly open a new one so other functions keep working without
+    errors.
+    """
     global _DB_CONN
     if _DB_CONN is None:
         await connect_db()
@@ -97,6 +103,50 @@ async def _ensure_schema(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
+def _cleanup_old_backups(limit: int = 20, max_age_days: int = 30, max_total_mb: int = 500) -> None:
+    """Remove aging or excess backup files.
+
+    Backups older than ``max_age_days`` or beyond ``limit`` most recent copies
+    are deleted.  If the combined size of backups exceeds ``max_total_mb`` we
+    prune the oldest ones until the total drops below the limit.  The work is
+    synchronous and intended to be run in a thread.
+    """
+    backups = sorted(
+        _BACKUP_DIR.glob("trades.db.*.bak*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+    total_size = 0
+    kept: List[Path] = []
+    removed = 0
+    for p in backups:
+        mtime = datetime.utcfromtimestamp(p.stat().st_mtime)
+        if mtime < cutoff:
+            p.unlink(missing_ok=True)
+            removed += 1
+            continue
+        if len(kept) >= limit:
+            p.unlink(missing_ok=True)
+            removed += 1
+            continue
+        kept.append(p)
+    for p in kept:
+        total_size += p.stat().st_size
+    kept_sorted = sorted(kept, key=lambda p: p.stat().st_mtime, reverse=True)
+    while total_size / 1_048_576 > max_total_mb and kept_sorted:
+        victim = kept_sorted.pop()
+        total_size -= victim.stat().st_size
+        victim.unlink(missing_ok=True)
+        removed += 1
+    logger.info(
+        "Backup cleanup: kept %d, removed %d, total size %.2f MB",
+        len(kept_sorted),
+        removed,
+        total_size / 1_048_576,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. async connect_db
 # ---------------------------------------------------------------------------
@@ -112,6 +162,7 @@ async def connect_db(db_path: str = str(_DB_PATH), retries: int = 3) -> None:
     for attempt in range(1, retries + 1):
         try:
             _DB_CONN = await aiosqlite.connect(db_path)
+            await _DB_CONN.execute("PRAGMA journal_mode=WAL")
             await _ensure_schema(_DB_CONN)
             logger.info("Connected to database at %s", db_path)
             return
@@ -194,46 +245,104 @@ async def query_data(
     max_qty: Optional[float] = None,
     min_funding: Optional[float] = None,
     max_funding: Optional[float] = None,
+    parallel: bool = False,
+    chunk_days: int = 30,
 ) -> List[Dict[str, Any]]:
-    """Return records for a pair between two dates with optional filters.
+    """Return records for a pair between two dates.
 
-    Extra parameters allow deeper analysis, letting us peek only at trades that
-    match certain quantity or funding rate ranges.
+    Optional filters narrow results by quantity and funding rate.  Setting
+    ``parallel=True`` splits the date range into ``chunk_days`` segments and
+    queries them concurrently using separate connections.  This speeds up large
+    reads when the table grows big.
     """
-    conn = await _get_conn()
-    try:
-        query = (
-            "SELECT timestamp, spot_symbol, futures_symbol, "
-            "spot_bid, futures_ask, trade_qty, funding_rate "
-            "FROM trades WHERE spot_symbol=? AND futures_symbol=? "
-            "AND timestamp BETWEEN ? AND ?"
-        )
-        params: List[Any] = [spot_symbol, futures_symbol, start_date, end_date]
+
+    base_query = (
+        "SELECT timestamp, spot_symbol, futures_symbol, "
+        "spot_bid, futures_ask, trade_qty, funding_rate "
+        "FROM trades WHERE spot_symbol=? AND futures_symbol=? "
+        "AND timestamp BETWEEN ? AND ?"
+    )
+
+    def _build_params(start: str, end: str) -> List[Any]:
+        params: List[Any] = [spot_symbol, futures_symbol, start, end]
         if min_qty is not None:
-            query += " AND trade_qty >= ?"
             params.append(min_qty)
         if max_qty is not None:
-            query += " AND trade_qty <= ?"
             params.append(max_qty)
         if min_funding is not None:
-            query += " AND funding_rate >= ?"
             params.append(min_funding)
         if max_funding is not None:
-            query += " AND funding_rate <= ?"
             params.append(max_funding)
-        query += " ORDER BY timestamp"
-        cursor = await conn.execute(query, params)
-        rows = await cursor.fetchall()
-        cols = [c[0] for c in cursor.description]
-        df = pd.DataFrame(rows, columns=cols)
-        return df.to_dict("records")
-    except Exception as exc:
-        logger.error("Query failed: %s", exc)
+        return params
+
+    filter_clause = ""
+    if min_qty is not None:
+        filter_clause += " AND trade_qty >= ?"
+    if max_qty is not None:
+        filter_clause += " AND trade_qty <= ?"
+    if min_funding is not None:
+        filter_clause += " AND funding_rate >= ?"
+    if max_funding is not None:
+        filter_clause += " AND funding_rate <= ?"
+
+    async def _run_chunk(start: str, end: str) -> List[Dict[str, Any]]:
         try:
-            await notify("Database query failed", str(exc))
-        except Exception:
-            pass
-        return []
+            async with aiosqlite.connect(str(_DB_PATH)) as conn:
+                query = base_query + filter_clause + " ORDER BY timestamp"
+                cursor = await conn.execute(query, _build_params(start, end))
+                rows = await cursor.fetchall()
+                cols = [c[0] for c in cursor.description]
+                df = pd.DataFrame(rows, columns=cols)
+                return df.to_dict("records")
+        except Exception as exc:
+            logger.error("Parallel query chunk failed: %s", exc)
+            try:
+                await notify("Database query failed", str(exc))
+            except Exception:
+                pass
+            return []
+
+    if not parallel:
+        conn = await _get_conn()
+        try:
+            query = base_query + filter_clause + " ORDER BY timestamp"
+            cursor = await conn.execute(query, _build_params(start_date, end_date))
+            rows = await cursor.fetchall()
+            cols = [c[0] for c in cursor.description]
+            df = pd.DataFrame(rows, columns=cols)
+            return df.to_dict("records")
+        except Exception as exc:
+            logger.error("Query failed: %s", exc)
+            try:
+                await notify("Database query failed", str(exc))
+            except Exception:
+                pass
+            return []
+
+    # Parallel branch -------------------------------------------------------
+    start_dt = datetime.fromisoformat(start_date)
+    end_dt = datetime.fromisoformat(end_date)
+    ranges: List[Sequence[str]] = []
+    cur = start_dt
+    delta = timedelta(days=chunk_days)
+    while cur < end_dt:
+        chunk_end = min(cur + delta, end_dt)
+        ranges.append((cur.isoformat(), chunk_end.isoformat()))
+        cur = chunk_end + timedelta(microseconds=1)
+
+    tasks = [asyncio.create_task(_run_chunk(s, e)) for s, e in ranges]
+    results: List[Dict[str, Any]] = []
+    for part in await asyncio.gather(*tasks, return_exceptions=True):
+        if isinstance(part, list):
+            results.extend(part)
+        else:
+            logger.error("Parallel query task error: %s", part)
+            try:
+                await notify("Database parallel query failed", str(part))
+            except Exception:
+                pass
+    results.sort(key=lambda x: x["timestamp"])
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +376,7 @@ async def backup_database(compress: bool = True) -> None:
             backup_file = backup_file.with_suffix(backup_file.suffix + ".gz")
         await loop.run_in_executor(_EXECUTOR, _copy, _DB_PATH, backup_file)
         logger.info("Database backup created at %s", backup_file)
+        await loop.run_in_executor(_EXECUTOR, _cleanup_old_backups)
     except Exception as exc:
         logger.error("Database backup failed: %s", exc)
         await notify("Database backup failed", str(exc))
