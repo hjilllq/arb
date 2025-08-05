@@ -83,55 +83,79 @@ CONFIG: Dict[str, Any] = {}
 _EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 
+class ConfigError(RuntimeError):
+    """Raised when configuration cannot be loaded or is invalid."""
+
+
 # ---------------------------------------------------------------------------
 # 1. load_config                                                             
 # ---------------------------------------------------------------------------
-def load_config(file_path: str = ".env") -> Dict[str, str]:
-    """Read a ``.env`` file and return a dictionary of settings.
+def load_config(file_path: str = ".env", *, reload: bool = False) -> Dict[str, str]:
+    """Read configuration from ``.env`` and optional JSON helpers.
 
-    It is like opening a lunchbox to see every snack inside.  Reading is done
-    with :func:`dotenv_values` to minimise disk chatter.  If the ``.env`` file
-    is missing we peek at environment variables instead of giving up.
+    The first call fills the global :data:`CONFIG` cache so repeated access is
+    fast.  Set ``reload=True`` to re-read the file.
 
     Parameters
     ----------
     file_path:
-        Where the ``.env`` file lives.  Defaults to ``".env"`` next to this
-        module.
+        Path to the ``.env`` file.
+    reload:
+        Force re-reading the file even if we already have a cached copy.
 
     Returns
     -------
     dict
-        Mapping of names to values, e.g. ``{"API_KEY": "abc"}``.  Environment
-        variables are used as a fallback when the file is missing.
-
-    Examples
-    --------
-    >>> config = load_config()
-    >>> config.get("API_KEY")  # doctest: +SKIP
-    'FSE8dMTTSC6qgLbfOs'
+        Mapping of names to values.  Keys loaded from JSON helpers are stored as
+        strings for consistency.
     """
+
+    if CONFIG and not reload and Path(file_path) == _ENV_PATH:
+        return CONFIG
+
     env_path = Path(file_path)
-    if not env_path.exists():
-        logger.warning("Config file %s is missing. Using default values.", file_path)
+    try:
+        if env_path.exists():
+            config = dotenv_values(env_path)
+            logger.info("Config loaded from %s", file_path)
+        else:
+            logger.warning("Config file %s is missing. Using environment only.", file_path)
+            try:
+                asyncio.run(notify("Config file missing", file_path))
+            except RuntimeError:
+                pass
+            config = dotenv_values()
+            if not config:
+                config = dict(os.environ)
+        if not config:
+            raise ConfigError("No configuration found")
+    except OSError as exc:
+        logger.error("Config read error: %s", exc)
         try:
-            asyncio.run(notify("Config file missing", file_path))
-        except RuntimeError:  # event loop already running
+            asyncio.run(notify("Config read error", str(exc)))
+        except RuntimeError:
             pass
-        config = dotenv_values()
-        if config:
-            logger.info("Config loaded from environment variables")
-            return config
-        env_config = dict(os.environ)
-        if env_config:
-            logger.info("Config loaded from OS environment variables")
-            return env_config
-        logger.critical(
-            "No configuration found. Please define environment variables or .env file."
-        )
-        raise ValueError("Configuration missing")
-    config = dotenv_values(env_path)
-    logger.info("Config loaded from %s", file_path)
+        raise ConfigError(str(exc)) from exc
+
+    thresholds_file = config.get("THRESHOLDS_FILE")
+    if thresholds_file:
+        t_path = Path(thresholds_file)
+        if not t_path.is_absolute():
+            t_path = env_path.parent / t_path
+        try:
+            extra = json.loads(t_path.read_text())
+        except Exception as exc:
+            logger.error("Threshold file error %s: %s", t_path, exc)
+            try:
+                asyncio.run(notify("Threshold file error", f"{t_path}: {exc}"))
+            except RuntimeError:
+                pass
+        else:
+            config.update({k: str(v) for k, v in extra.items()})
+
+    if Path(file_path) == _ENV_PATH:
+        CONFIG.clear()
+        CONFIG.update(config)
     return config
 
 
@@ -183,6 +207,8 @@ def validate_config(config: Dict[str, Any]) -> bool:
                 raise ValueError(f"invalid spot pair format: {s_pair}")
             if not fut_re.match(f_pair):
                 raise ValueError(f"invalid futures pair format: {f_pair}")
+            if s_pair.replace("/", "") != f_pair.replace("-", ""):
+                raise ValueError(f"spot/futures mismatch: {s_pair} vs {f_pair}")
 
             base = s_pair.replace("/", "_")
             open_key = f"{base}_BASIS_THRESHOLD_OPEN"
@@ -391,22 +417,35 @@ async def update_config(key: str, value: Any) -> None:
     --------
     >>> asyncio.run(update_config('MAX_DAILY_LOSS', 0.1))  # doctest: +SKIP
     """
+    if CONFIG.get(key) == value:
+        logger.debug("Config for %s unchanged; skipping disk write", key)
+        return
     CONFIG[key] = value
 
     lines: List[str] = []
     if _ENV_PATH.exists():
-        async with aiofiles.open(_ENV_PATH, mode="r", encoding="utf-8") as f:
-            lines = await f.readlines()
+        try:
+            async with aiofiles.open(_ENV_PATH, mode="r", encoding="utf-8") as f:
+                lines = await f.readlines()
+        except OSError as exc:
+            logger.error("Config read failed: %s", exc)
+            await notify("Config update failed", str(exc))
+            raise
     line_written = False
-    async with aiofiles.open(_ENV_PATH, mode="w", encoding="utf-8") as f:
-        for line in lines:
-            if line.startswith(f"{key}="):
+    try:
+        async with aiofiles.open(_ENV_PATH, mode="w", encoding="utf-8") as f:
+            for line in lines:
+                if line.startswith(f"{key}="):
+                    await f.write(f"{key}={value}\n")
+                    line_written = True
+                else:
+                    await f.write(line)
+            if not line_written:
                 await f.write(f"{key}={value}\n")
-                line_written = True
-            else:
-                await f.write(line)
-        if not line_written:
-            await f.write(f"{key}={value}\n")
+    except OSError as exc:
+        logger.error("Config write failed: %s", exc)
+        await notify("Config update failed", str(exc))
+        raise
     logger.info("Updated %s in config", key)
 
 
