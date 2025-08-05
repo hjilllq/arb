@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 # ---------------------------------------------------------------------------
 # Helper notifier: real notification_manager will replace this later.
@@ -39,6 +39,14 @@ _ARCHIVE_DIR.mkdir(exist_ok=True)
 _FERNET_KEY_PATH = Path(os.getenv("FERNET_KEY_PATH", Path.home() / ".fernet.key"))
 if _FERNET_KEY_PATH.exists():
     _FERNET_KEY = _FERNET_KEY_PATH.read_bytes().strip()
+    try:
+        if (_FERNET_KEY_PATH.stat().st_mode & 0o777) != 0o600:
+            logging.getLogger(__name__).warning(
+                "Fernet key permissions are %o, expected 600",
+                _FERNET_KEY_PATH.stat().st_mode & 0o777,
+            )
+    except OSError:  # pragma: no cover - OS-specific
+        pass
 else:  # create a key once and protect permissions
     _FERNET_KEY = Fernet.generate_key()
     _FERNET_KEY_PATH.write_bytes(_FERNET_KEY)
@@ -61,6 +69,42 @@ _logger = logging.getLogger("arb.bot")
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+def _has_disk_space(required_mb: int = 1) -> bool:
+    """Check that at least ``required_mb`` of free space is available.
+
+    Warns and sends a notification if disk space is low.  This avoids failed
+    writes when the filesystem is full.
+    """
+    try:
+        free_mb = shutil.disk_usage(_ARCHIVE_DIR).free / (1024 * 1024)
+    except OSError:
+        return True  # assume enough space if we cannot determine
+    if free_mb < required_mb:
+        _logger.error("Low disk space: %.1f MB left", free_mb)
+        try:
+            asyncio.get_running_loop().create_task(
+                notify("Low disk space", f"{free_mb:.1f} MB free")
+            )
+        except RuntimeError:  # no running loop
+            pass
+        return False
+    return True
+
+
+def _cleanup_old_archives(limit: int = 10) -> None:
+    """Remove old log archives keeping only the newest ``limit`` files."""
+    backups = sorted(
+        _ARCHIVE_DIR.glob("bot.log.*.bak"), key=lambda p: p.stat().st_mtime
+    )
+    if len(backups) <= limit:
+        return
+    for old in backups[:-limit]:
+        try:
+            old.unlink()
+            _logger.info("Old backup removed: %s", old)
+        except OSError as exc:  # pragma: no cover - ignore deletion errors
+            _logger.warning("Failed to remove old backup %s: %s", old, exc)
+
 def _maybe_encrypt(message: str) -> str:
     """Encrypt message if it contains secret words.
 
@@ -215,7 +259,17 @@ def decrypt_log(token: bytes) -> str:
     >>> decrypt_log(encrypt_log("secret"))
     'secret'
     """
-    return _CIPHER.decrypt(token).decode()
+    try:
+        return _CIPHER.decrypt(token).decode()
+    except (InvalidToken, ValueError) as exc:
+        _logger.error("Decryption failed for token: %s", exc)
+        try:
+            asyncio.get_running_loop().create_task(
+                notify("Decryption error", str(exc))
+            )
+        except RuntimeError:
+            pass
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +279,9 @@ async def archive_logs() -> None:
     """Archive the current log file into ``logs_archive`` with a timestamp."""
     if not _LOG_FILE.exists():
         return
+    if not _has_disk_space():
+        await notify("Archive skipped", "Low disk space")
+        return
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     archive_file = _ARCHIVE_DIR / f"bot.log.{timestamp}.bak"
     loop = asyncio.get_running_loop()
@@ -233,7 +290,8 @@ async def archive_logs() -> None:
     except Exception as exc:  # pragma: no cover - disk errors
         await notify("Archive failed", str(exc))
     else:
-        await log_info(f"Logs archived to {archive_file}")
+        await log_info(f"Log file successfully archived to {archive_file}")
+        await loop.run_in_executor(_EXECUTOR, _cleanup_old_archives)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +311,9 @@ async def clear_logs(max_size_mb: int = 100) -> None:
     if size_mb <= max_size_mb:
         return
     await archive_logs()
+    if not _has_disk_space():
+        await notify("Clear logs skipped", "Low disk space")
+        return
     loop = asyncio.get_running_loop()
     try:
         def _truncate() -> None:
