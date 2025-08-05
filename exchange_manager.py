@@ -35,7 +35,12 @@ _last_health: Dict[str, float] = {}
 _MARKET_CACHE: Dict[str, tuple[float, Dict]] = {}
 # Small cache for pair synchronization: key (tuple of exchanges) -> (timestamp, mapping)
 _PAIR_CACHE: Dict[tuple[str, ...], tuple[float, Dict[str, str]]] = {}
-_PAIR_TTL = 300  # seconds to reuse pair sync results
+# Adaptive TTL so the cache refreshes faster when mappings change often and
+# slows down during quiet periods.  Values in seconds.
+_PAIR_TTL_MIN = 60
+_PAIR_TTL_MAX = 900
+_PAIR_TTL_STEP = 60
+_PAIR_TTLS: Dict[tuple[str, ...], int] = {}
 # Track long outages so we don't spam alerts every check
 _OUTAGE_THRESHOLD = 1800  # seconds (30 minutes)
 # Remember when outages were last reported to allow periodic reminders
@@ -197,9 +202,11 @@ async def get_markets(exchange_name: str, ttl: int = 300) -> Dict:
 async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
     """Ensure all exchanges support the required spot/futures pairs.
 
-    We cross-check the pair list from :func:`config.get_pair_mapping` with the
-    markets reported by each exchange.  Pairs missing on any exchange are
-    dropped from the result.
+    Results are cached with an adaptive time-to-live: when mappings remain
+    stable the cache window widens, and if anything changes it shrinks to
+    refresh quickly.  We cross-check the pair list from
+    :func:`config.get_pair_mapping` with the markets reported by each exchange.
+    Pairs missing on any exchange are dropped from the result.
 
     Parameters
     ----------
@@ -221,8 +228,9 @@ async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
 
     key = tuple(sorted(name.lower() for name in exchanges))
     now = time.time()
+    ttl = _PAIR_TTLS.get(key, _PAIR_TTL_MIN)
     cached = _PAIR_CACHE.get(key)
-    if cached and now - cached[0] < _PAIR_TTL:
+    if cached and now - cached[0] < ttl:
         return cached[1]
 
     # Load markets concurrently, reusing cached results where possible.
@@ -256,8 +264,14 @@ async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
             logger.warning("Pair %s/%s missing on %s", spot_pair, fut_pair, ", ".join(missing))
         else:
             valid_mapping[spot_pair] = fut_pair
+    previous = cached[1] if cached else None
     _PAIR_CACHE[key] = (now, valid_mapping)
-    logger.info("Pair sync result: %s", valid_mapping)
+    if previous and previous != valid_mapping:
+        ttl = _PAIR_TTL_MIN
+    else:
+        ttl = min(ttl + _PAIR_TTL_STEP, _PAIR_TTL_MAX)
+    _PAIR_TTLS[key] = ttl
+    logger.info("Pair sync result: %s (ttl=%d s)", valid_mapping, ttl)
     return valid_mapping
 
 
@@ -281,12 +295,14 @@ async def check_exchange_health(exchange_name: str) -> bool:
     if client is None:
         # Even if removed, keep reminding operators about persistent outages
         last = _last_health.get(name, 0)
-        if now - last > _OUTAGE_THRESHOLD:
+        downtime = now - last
+        if downtime > _OUTAGE_THRESHOLD:
             last_alert = _LAST_OUTAGE_ALERT.get(name, 0)
             if now - last_alert > _OUTAGE_ALERT_INTERVAL:
                 _LAST_OUTAGE_ALERT[name] = now
-                logger.critical("Exchange %s still offline", name)
-                await notify("Exchange outage", name)
+                minutes = int(downtime // 60)
+                logger.critical("Exchange %s still offline (%d min)", name, minutes)
+                await notify("Exchange outage", f"{name} down {minutes}m")
         logger.error("Exchange %s not registered", name)
         return False
     try:
@@ -318,28 +334,36 @@ async def check_exchange_health(exchange_name: str) -> bool:
     last = _last_health.get(name, 0)
     if name == "bybit" and now - last > 300:
         await switch_to_backup_exchange()
-    if now - last > _OUTAGE_THRESHOLD:
+    downtime = now - last
+    if downtime > _OUTAGE_THRESHOLD:
+        minutes = int(downtime // 60)
         last_alert = _LAST_OUTAGE_ALERT.get(name, 0)
         if now - last_alert > _OUTAGE_ALERT_INTERVAL:
             _LAST_OUTAGE_ALERT[name] = now
             if name not in _OUTAGE_REPORTED:
                 _OUTAGE_REPORTED.add(name)
-                logger.critical("Exchange %s outage detected", name)
+                logger.critical("Exchange %s outage detected (%d min)", name, minutes)
             else:
-                logger.critical("Exchange %s outage persists", name)
-            await notify("Exchange outage", name)
-        await remove_exchange(name)
+                logger.critical("Exchange %s outage persists (%d min)", name, minutes)
+            await notify("Exchange outage", f"{name} down {minutes}m")
+        logger.error("Removing %s after %d min offline", name, minutes)
+        await remove_exchange(name, downtime)
     return False
 
 
 # ---------------------------------------------------------------------------
 # 7. remove_exchange
 # ---------------------------------------------------------------------------
-async def remove_exchange(exchange_name: str) -> None:
+async def remove_exchange(exchange_name: str, downtime: float | None = None) -> None:
     """Remove an exchange client and forget its cached data.
 
-    This is called when an exchange is deemed offline for too long.  Any
-    active designation is cleared so the caller can choose another venue.
+    Parameters
+    ----------
+    exchange_name:
+        Name of the exchange to drop.
+    downtime:
+        Seconds the venue has been unreachable. Used for logging to report how
+        long the outage lasted.
     """
 
     name = exchange_name.lower()
@@ -350,11 +374,14 @@ async def remove_exchange(exchange_name: str) -> None:
         except Exception:
             pass
     _MARKET_CACHE.pop(name, None)
-    # keep _last_health so we can continue to report how long the venue has been offline
+    # keep _last_health so later checks know how long we've been offline
     global _active_exchange
     if _active_exchange == name:
         _active_exchange = None
-    logger.warning("Exchange %s removed due to outage", name)
+    if downtime is not None:
+        logger.warning("Exchange %s removed after %.1f min offline", name, downtime / 60)
+    else:
+        logger.warning("Exchange %s removed due to outage", name)
 
 
 # ---------------------------------------------------------------------------
