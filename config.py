@@ -63,6 +63,7 @@ else:
         os.chmod(_FERNET_KEY_PATH, 0o600)  # owner read/write
     except OSError:  # pragma: no cover - depends on OS
         pass
+    logger.info("Fernet key generated and saved to %s", _FERNET_KEY_PATH)
 _CIPHER = Fernet(_FERNET_KEY)
 
 # This global cache will hold the latest configuration after load_config runs.
@@ -77,7 +78,7 @@ def load_config(file_path: str = ".env") -> Dict[str, str]:
 
     It is like opening a lunchbox to see every snack inside.  Reading is done
     with :func:`dotenv_values` to minimise disk chatter.  If the ``.env`` file
-    is missing we simply warn and carry on with empty pockets.
+    is missing we peek at environment variables instead of giving up.
 
     Parameters
     ----------
@@ -88,8 +89,8 @@ def load_config(file_path: str = ".env") -> Dict[str, str]:
     Returns
     -------
     dict
-        Mapping of names to values, e.g. ``{"API_KEY": "abc"}``.  An empty
-        dictionary is returned when the file is missing.
+        Mapping of names to values, e.g. ``{"API_KEY": "abc"}``.  Environment
+        variables are used as a fallback when the file is missing.
 
     Examples
     --------
@@ -104,7 +105,10 @@ def load_config(file_path: str = ".env") -> Dict[str, str]:
             asyncio.run(notify("Config file missing", file_path))
         except RuntimeError:  # event loop already running
             pass
-        return {}
+        config = dotenv_values()
+        if config:
+            logger.info("Config loaded from environment variables")
+        return config
     config = dotenv_values(env_path)
     logger.info("Config loaded from %s", file_path)
     return config
@@ -120,8 +124,8 @@ def validate_config(config: Dict[str, Any]) -> bool:
 
     Validation rules
     ----------------
-    * Pair lists must exist and be the same length.
-    * Pairs must follow ``AAA/BBB`` or ``AAABBB`` formats.
+    * Pair lists must exist, match in length, and contain no duplicates.
+    * Pairs must follow ``AAA/BBB`` or ``AAABBB`` formats with no extra spaces.
     * Every threshold must be positive.
 
     Parameters
@@ -137,10 +141,16 @@ def validate_config(config: Dict[str, Any]) -> bool:
     try:
         spot_pairs = json.loads(config.get("SPOT_PAIRS", "[]").replace("'", '"'))
         futures_pairs = json.loads(config.get("FUTURES_PAIRS", "[]").replace("'", '"'))
+        spot_pairs = [s.strip() for s in spot_pairs]
+        futures_pairs = [s.strip() for s in futures_pairs]
         if not spot_pairs or not futures_pairs:
             raise ValueError("pair lists cannot be empty")
         if len(spot_pairs) != len(futures_pairs):
             raise ValueError("spot and futures pairs mismatch")
+        if len(set(spot_pairs)) != len(spot_pairs):
+            raise ValueError("duplicate spot pairs detected")
+        if len(set(futures_pairs)) != len(futures_pairs):
+            raise ValueError("duplicate futures pairs detected")
 
         spot_re = re.compile(r"^[A-Z0-9]+/[A-Z0-9]+$")
         fut_re = re.compile(r"^[A-Z0-9]+[-]?[A-Z0-9]+$")
@@ -383,6 +393,16 @@ async def backup_config() -> None:
     async with aiofiles.open(backup_file, mode="wb") as fdst:
         await fdst.write(data)
     logger.info("Backup created: %s", backup_file)
+
+    # Clean up backups older than 30 days to save disk space.
+    cutoff = datetime.utcnow().timestamp() - 30 * 24 * 3600
+    for backup in _BACKUP_DIR.glob("*.bak"):
+        try:
+            if backup.stat().st_mtime < cutoff:
+                backup.unlink()
+                logger.info("Old backup removed: %s", backup)
+        except OSError:  # pragma: no cover - rare file system issue
+            logger.warning("Failed to inspect/delete backup: %s", backup)
 
 
 # ---------------------------------------------------------------------------
