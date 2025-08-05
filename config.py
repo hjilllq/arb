@@ -13,7 +13,10 @@ import asyncio
 import json
 import os
 import re
+import shutil
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from itertools import chain
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -75,6 +78,9 @@ _CIPHER = Fernet(_FERNET_KEY)
 
 # This global cache will hold the latest configuration after load_config runs.
 CONFIG: Dict[str, Any] = {}
+
+# Executor for tiny background file tasks like backups.
+_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 
 # ---------------------------------------------------------------------------
@@ -408,12 +414,12 @@ async def update_config(key: str, value: Any) -> None:
 # 10. backup_config                                                          
 # ---------------------------------------------------------------------------
 async def backup_config() -> None:
-    """Create a timestamped copy of the ``.env`` file asynchronously.
+    """Create a timestamped copy of ``.env`` using a background thread.
 
-    The backup sits in ``backups/`` like a photograph of our settings, so we
-    can always look back if something goes wrong.  Old backups are cleaned
-    based on ``BACKUP_RETENTION_DAYS`` (default ``30``) and ``MAX_BACKUPS``
-    from the configuration.
+    The work is handed to :class:`ThreadPoolExecutor` so the main loop stays
+    snappy even on a busy little M4 chip.  Old backups are trimmed by age and
+    count based on ``BACKUP_RETENTION_DAYS`` and ``MAX_BACKUPS`` in the
+    configuration.
 
     Examples
     --------
@@ -423,34 +429,45 @@ async def backup_config() -> None:
         logger.error("Cannot backup: %s does not exist", _ENV_PATH)
         await notify("Backup failed", ".env missing")
         return
+
+    loop = asyncio.get_running_loop()
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     backup_file = _BACKUP_DIR / f".env.{timestamp}.bak"
-    async with aiofiles.open(_ENV_PATH, mode="rb") as fsrc:
-        data = await fsrc.read()
-    async with aiofiles.open(backup_file, mode="wb") as fdst:
-        await fdst.write(data)
+
+    try:
+        await loop.run_in_executor(_EXECUTOR, shutil.copy2, _ENV_PATH, backup_file)
+    except OSError as exc:
+        logger.error("Backup copy failed: %s", exc)
+        await notify("Backup failed", str(exc))
+        return
     logger.info("Backup created: %s", backup_file)
 
     retention_days = int(CONFIG.get("BACKUP_RETENTION_DAYS", 30))
     max_backups = int(CONFIG.get("MAX_BACKUPS", 0))  # 0 means unlimited
-
     cutoff = datetime.utcnow().timestamp() - retention_days * 24 * 3600
-    backups = sorted(_BACKUP_DIR.glob("*.bak"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for bk in backups:
-        try:
-            if bk.stat().st_mtime < cutoff:
-                bk.unlink()
-                logger.info("Old backup removed: %s", bk)
-        except OSError:  # pragma: no cover - rare file system issue
-            logger.warning("Failed to inspect/delete backup: %s", bk)
 
-    if max_backups and len(backups) > max_backups:
-        for bk in backups[max_backups:]:
+    def _cleanup() -> None:
+        backups = sorted(
+            chain(_BACKUP_DIR.glob("*.bak"), _BACKUP_DIR.glob(".*.bak")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for bk in backups:
             try:
-                bk.unlink()
-                logger.info("Excess backup removed: %s", bk)
+                if bk.stat().st_mtime < cutoff:
+                    bk.unlink()
+                    logger.info("Old backup removed: %s", bk)
             except OSError:  # pragma: no cover - rare file system issue
-                logger.warning("Failed to remove backup: %s", bk)
+                logger.warning("Failed to inspect/delete backup: %s", bk)
+        if max_backups and len(backups) > max_backups:
+            for bk in backups[max_backups:]:
+                try:
+                    bk.unlink()
+                    logger.info("Excess backup removed: %s", bk)
+                except OSError:  # pragma: no cover - rare file system issue
+                    logger.warning("Failed to remove backup: %s", bk)
+
+    await loop.run_in_executor(_EXECUTOR, _cleanup)
 
 
 # ---------------------------------------------------------------------------
