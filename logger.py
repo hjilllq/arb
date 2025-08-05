@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -94,7 +95,10 @@ def _has_disk_space(path: Path | str = _ARCHIVE_DIR, required_mb: int = 1) -> bo
     if free_mb < required_mb:
         try:
             asyncio.get_running_loop().create_task(
-                notify("Low disk space", f"{free_mb:.1f} MB free")
+                notify(
+                    "Low disk space",
+                    f"{p} has only {free_mb:.1f} MB free",
+                )
             )
         except RuntimeError:
             pass
@@ -148,6 +152,11 @@ def _log_shutdown() -> None:
     """Record a final message when the application exits."""
     try:
         _logger.info("Logger shutting down")
+        for handler in _logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -155,8 +164,8 @@ def _log_shutdown() -> None:
 atexit.register(_log_shutdown)
 
 
-async def _log_with_retry(func, msg: str, retries: int = 1) -> None:
-    """Write a log message with a small retry in case of transient failures."""
+async def _log_with_retry(func, msg: str, retries: int = 3) -> None:
+    """Write a log message with retries and jitter for transient failures."""
     if not _has_disk_space(_LOG_FILE.parent):
         await notify("Log write skipped", "Disk unavailable")
         return
@@ -167,10 +176,10 @@ async def _log_with_retry(func, msg: str, retries: int = 1) -> None:
             return
         except Exception as exc:  # pragma: no cover - disk full or permission
             if attempt < retries:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(random.uniform(0.1, 0.5))
                 continue
             try:
-                await notify("Log write failed", str(exc))
+                await notify("Log write failed", f"{exc}")
             except Exception:
                 pass
             return
