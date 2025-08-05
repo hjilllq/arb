@@ -1,10 +1,20 @@
 from datetime import datetime, timedelta
 
 import asyncio
+import importlib
 import pytest
 import pytest_asyncio
 
+import config
 import database
+
+
+def test_query_semaphore_from_env(monkeypatch):
+    monkeypatch.setattr(config, "CONFIG", {"DB_QUERY_CONCURRENCY": "2"})
+    importlib.reload(database)
+    assert database._QUERY_SEMAPHORE._value == 2
+    monkeypatch.setattr(config, "CONFIG", {})
+    importlib.reload(database)
 
 
 @pytest_asyncio.fixture
@@ -29,6 +39,8 @@ async def test_save_and_query(temp_db):
             "futures_symbol": "BTCUSDT",
             "spot_bid": 59990,
             "futures_ask": 60000,
+            "trade_qty": 1.5,
+            "funding_rate": 0.001,
         },
         {
             "timestamp": (datetime.utcnow() + timedelta(minutes=1)).isoformat(),
@@ -36,6 +48,8 @@ async def test_save_and_query(temp_db):
             "futures_symbol": "BTCUSDT",
             "spot_bid": 60010,
             "futures_ask": 60020,
+            "trade_qty": 2.0,
+            "funding_rate": 0.002,
         },
     ]
     await database.save_data(rows)
@@ -44,6 +58,8 @@ async def test_save_and_query(temp_db):
     )
     assert len(data) == 2
     assert data[0]["spot_bid"] == 59990
+    assert data[0]["trade_qty"] == 1.5
+    assert data[0]["funding_rate"] == 0.001
 
 
 @pytest.mark.asyncio
@@ -117,6 +133,19 @@ def test_validate_data_rejects_bad_symbols():
         }
     ]
     assert database.validate_data(bad) is False
+
+
+def test_validate_data_accepts_hyphen_suffix():
+    good = [
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "spot_symbol": "BTC/USDT",
+            "futures_symbol": "BTCUSDT-PERP",
+            "spot_bid": 1,
+            "futures_ask": 2,
+        }
+    ]
+    assert database.validate_data(good) is True
 
 
 @pytest.mark.asyncio

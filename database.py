@@ -20,6 +20,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import aiosqlite
 import pandas as pd
 
+try:  # pragma: no cover - config helper may not be present in tests
+    from config import load_config  # type: ignore
+except Exception:  # pragma: no cover - fallback to empty config
+    def load_config(*_args, **_kwargs):  # type: ignore
+        """Return empty config if real loader is missing."""
+        return {}
+
 # ---------------------------------------------------------------------------
 # Helper setup: logger and notifier. Real modules will be plugged in later.
 # ---------------------------------------------------------------------------
@@ -53,12 +60,19 @@ _BACKUP_DIR = Path("backups")
 # Connection stored globally after :func:`connect_db` runs.
 _DB_CONN: Optional[aiosqlite.Connection] = None
 
-# Limit concurrent query connections so SQLite isn't overwhelmed.
-_QUERY_SEMAPHORE = asyncio.Semaphore(5)
+# Limit concurrent query connections so SQLite isn't overwhelmed.  The default
+# value of ``5`` can be overridden via the ``DB_QUERY_CONCURRENCY`` setting in
+# ``.env`` so operators can tune performance without touching the code.
+_CONFIG = load_config()
+_QUERY_SEMAPHORE = asyncio.Semaphore(
+    int(_CONFIG.get("DB_QUERY_CONCURRENCY", 5))
+)
 
 # Regular expressions to verify symbol formats.
 _SPOT_RE = re.compile(r"^[A-Z0-9]+/[A-Z0-9]+$")
-_FUTURES_RE = re.compile(r"^[A-Z0-9]+$")
+# Futures tickers sometimes carry suffixes like ``-USDT`` or ``PERP``; the
+# pattern below allows an optional hyphenated part.
+_FUTURES_RE = re.compile(r"^[A-Z0-9]+(-?[A-Z0-9]+)?$")
 
 
 async def _get_conn() -> aiosqlite.Connection:
@@ -377,10 +391,29 @@ async def backup_database(compress: bool = True) -> None:
     backup_file = _BACKUP_DIR / f"trades.db.{timestamp}.bak"
 
     def _copy(src: Path, dst: Path, do_compress: bool) -> None:
-        """Run the expensive file copy in a background thread."""
+        """Run the expensive file copy in a background thread.
+
+        For very large databases (>200 MB) we stream the file in small chunks
+        and log progress roughly every 50 MB so operators can see that the
+        backup is still moving along."""
+        size = src.stat().st_size
         if do_compress:
             with open(src, "rb") as fsrc, gzip.open(dst, "wb") as fdst:
-                shutil.copyfileobj(fsrc, fdst)
+                if size > 200 * 1_048_576:
+                    copied = 0
+                    step = 50 * 1_048_576
+                    while True:
+                        chunk = fsrc.read(1_048_576)
+                        if not chunk:
+                            break
+                        fdst.write(chunk)
+                        copied += len(chunk)
+                        if copied // step > (copied - len(chunk)) // step:
+                            logger.info(
+                                "Backup progress: %.0f%%", copied / size * 100
+                            )
+                else:
+                    shutil.copyfileobj(fsrc, fdst)
         else:
             shutil.copy2(src, dst)
 
