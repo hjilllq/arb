@@ -63,6 +63,12 @@ else:
         os.chmod(_FERNET_KEY_PATH, 0o600)  # owner read/write
     except OSError:  # pragma: no cover - depends on OS
         pass
+    mode = _FERNET_KEY_PATH.stat().st_mode & 0o777
+    if mode != 0o600:  # pragma: no cover - platform dependent
+        logger.warning(
+            "Fernet key permissions %s may be insecure; expected 0o600",
+            oct(mode),
+        )
     logger.info("Fernet key generated and saved to %s", _FERNET_KEY_PATH)
 _CIPHER = Fernet(_FERNET_KEY)
 
@@ -108,7 +114,15 @@ def load_config(file_path: str = ".env") -> Dict[str, str]:
         config = dotenv_values()
         if config:
             logger.info("Config loaded from environment variables")
-        return config
+            return config
+        env_config = dict(os.environ)
+        if env_config:
+            logger.info("Config loaded from OS environment variables")
+            return env_config
+        logger.critical(
+            "No configuration found. Please define environment variables or .env file."
+        )
+        raise ValueError("Configuration missing")
     config = dotenv_values(env_path)
     logger.info("Config loaded from %s", file_path)
     return config
@@ -126,7 +140,7 @@ def validate_config(config: Dict[str, Any]) -> bool:
     ----------------
     * Pair lists must exist, match in length, and contain no duplicates.
     * Pairs must follow ``AAA/BBB`` or ``AAABBB`` formats with no extra spaces.
-    * Every threshold must be positive.
+    * Every threshold must exist and be positive.
 
     Parameters
     ----------
@@ -164,10 +178,14 @@ def validate_config(config: Dict[str, Any]) -> bool:
             base = s_pair.replace("/", "_")
             open_key = f"{base}_BASIS_THRESHOLD_OPEN"
             close_key = f"{base}_BASIS_THRESHOLD_CLOSE"
-            open_val = float(config.get(open_key, 0))
-            close_val = float(config.get(close_key, 0))
+            if open_key not in config or close_key not in config:
+                raise ValueError(f"thresholds missing for {s_pair}")
+            open_val = float(config[open_key])
+            close_val = float(config[close_key])
             if open_val <= 0 or close_val <= 0:
-                raise ValueError(f"thresholds for {s_pair} must be > 0")
+                raise ValueError(
+                    f"thresholds for {s_pair} must be > 0, got open={open_val}, close={close_val}"
+                )
     except Exception as exc:  # broad to keep example child friendly
         logger.error("Validation failed: %s", exc)
         try:
@@ -376,7 +394,9 @@ async def backup_config() -> None:
     """Create a timestamped copy of the ``.env`` file asynchronously.
 
     The backup sits in ``backups/`` like a photograph of our settings, so we
-    can always look back if something goes wrong.
+    can always look back if something goes wrong.  Old backups are cleaned
+    based on ``BACKUP_RETENTION_DAYS`` (default ``30``) and ``MAX_BACKUPS``
+    from the configuration.
 
     Examples
     --------
@@ -394,15 +414,26 @@ async def backup_config() -> None:
         await fdst.write(data)
     logger.info("Backup created: %s", backup_file)
 
-    # Clean up backups older than 30 days to save disk space.
-    cutoff = datetime.utcnow().timestamp() - 30 * 24 * 3600
-    for backup in _BACKUP_DIR.glob("*.bak"):
+    retention_days = int(CONFIG.get("BACKUP_RETENTION_DAYS", 30))
+    max_backups = int(CONFIG.get("MAX_BACKUPS", 0))  # 0 means unlimited
+
+    cutoff = datetime.utcnow().timestamp() - retention_days * 24 * 3600
+    backups = sorted(_BACKUP_DIR.glob("*.bak"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for bk in backups:
         try:
-            if backup.stat().st_mtime < cutoff:
-                backup.unlink()
-                logger.info("Old backup removed: %s", backup)
+            if bk.stat().st_mtime < cutoff:
+                bk.unlink()
+                logger.info("Old backup removed: %s", bk)
         except OSError:  # pragma: no cover - rare file system issue
-            logger.warning("Failed to inspect/delete backup: %s", backup)
+            logger.warning("Failed to inspect/delete backup: %s", bk)
+
+    if max_backups and len(backups) > max_backups:
+        for bk in backups[max_backups:]:
+            try:
+                bk.unlink()
+                logger.info("Excess backup removed: %s", bk)
+            except OSError:  # pragma: no cover - rare file system issue
+                logger.warning("Failed to remove backup: %s", bk)
 
 
 # ---------------------------------------------------------------------------
@@ -410,10 +441,7 @@ async def backup_config() -> None:
 # ---------------------------------------------------------------------------
 try:  # pragma: no cover - executed at import
     CONFIG = load_config()
-    if CONFIG:
-        validate_config(CONFIG)
-    else:
-        logger.warning("Running with empty configuration; please check .env")
-except Exception as exc:  # pragma: no cover - prevents crash on import
+    validate_config(CONFIG)
+except Exception as exc:  # pragma: no cover - prevents silent failure
     logger.error("Initial configuration load failed: %s", exc)
-    CONFIG = {}
+    raise
