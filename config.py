@@ -139,6 +139,9 @@ def load_config(file_path: str = ".env", *, reload: bool = False) -> Dict[str, s
 
     thresholds_file = config.get("THRESHOLDS_FILE")
     if thresholds_file:
+        # Extra thresholds can live in a neat JSON file.  It keeps the main
+        # ``.env`` short and easy to read while still letting an operator tweak
+        # numbers on the fly.
         t_path = Path(thresholds_file)
         if not t_path.is_absolute():
             t_path = env_path.parent / t_path
@@ -152,6 +155,7 @@ def load_config(file_path: str = ".env", *, reload: bool = False) -> Dict[str, s
                 pass
         else:
             config.update({k: str(v) for k, v in extra.items()})
+            logger.info("Extra thresholds merged from %s", t_path)
 
     if Path(file_path) == _ENV_PATH:
         CONFIG.clear()

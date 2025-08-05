@@ -38,3 +38,44 @@ def test_validate_config_pair_mismatch():
         'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001'
     }
     assert not config.validate_config(bad)
+
+
+def test_validate_config_negative_threshold():
+    bad = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '-0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001'
+    }
+    assert not config.validate_config(bad)
+
+
+def test_load_config_thresholds_json_invalid(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("SPOT_PAIRS=['BTC/USDT']\nFUTURES_PAIRS=['BTCUSDT']\nTHRESHOLDS_FILE=extra.json\n")
+    extra = tmp_path / "extra.json"
+    extra.write_text("{bad json")
+    cfg = config.load_config(str(env), reload=True)
+    assert 'BTC_USDT_BASIS_THRESHOLD_OPEN' not in cfg
+
+
+def test_encrypt_decrypt_roundtrip():
+    data = {'API_KEY': 'abc', 'API_SECRET': 'xyz'}
+    enc = config.encrypt_config(data)
+    dec = config.decrypt_config(enc)
+    assert dec == data
+
+
+def test_update_and_backup(tmp_path, monkeypatch):
+    env = tmp_path / '.env'
+    env.write_text('API_KEY=foo\n')
+    backup_dir = tmp_path / 'backups'
+    backup_dir.mkdir()
+    monkeypatch.setattr(config, '_ENV_PATH', env)
+    monkeypatch.setattr(config, '_BACKUP_DIR', backup_dir)
+    monkeypatch.setattr(config, 'CONFIG', {'API_KEY': 'foo'})
+    import asyncio
+    asyncio.run(config.update_config('API_KEY', 'bar'))
+    assert 'API_KEY=bar' in env.read_text()
+    asyncio.run(config.backup_config())
+    assert any(backup_dir.iterdir())
