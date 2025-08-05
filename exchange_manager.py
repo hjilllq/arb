@@ -31,6 +31,11 @@ logger = get_logger(__name__)
 _EXCHANGES: Dict[str, ccxt.Exchange] = {}
 _active_exchange: str | None = None
 _last_health: Dict[str, float] = {}
+# Small cache to avoid reloading markets too often: name -> (timestamp, markets)
+_MARKET_CACHE: Dict[str, tuple[float, Dict]] = {}
+# Track long outages so we don't spam alerts every check
+_OUTAGE_THRESHOLD = 1800  # seconds (30 minutes)
+_OUTAGE_REPORTED: set[str] = set()
 
 # Helper mapping from logical names to config keys for API credentials.
 _KEY_MAP = {
@@ -124,7 +129,48 @@ def get_active_exchange() -> str:
 
 
 # ---------------------------------------------------------------------------
-# 4. sync_trading_pairs
+# 4. get_markets
+# ---------------------------------------------------------------------------
+async def get_markets(exchange_name: str, ttl: int = 300) -> Dict:
+    """Return market metadata for an exchange with caching.
+
+    The first call for a given exchange loads markets via ccxt and stores them
+    with a timestamp.  Subsequent calls within ``ttl`` seconds reuse the cached
+    copy which keeps the network calm and our ARM cores sleepy.
+
+    Parameters
+    ----------
+    exchange_name:
+        Name such as ``"bybit"``.  The exchange must be registered via
+        :func:`add_exchange`.
+    ttl:
+        Time-to-live for the cache in seconds.  Defaults to five minutes.
+
+    Returns
+    -------
+    dict
+        The markets dictionary as returned by ``ccxt``.
+    """
+
+    name = exchange_name.lower()
+    now = time.time()
+    cached = _MARKET_CACHE.get(name)
+    if cached and now - cached[0] < ttl:
+        return cached[1]
+
+    client = _EXCHANGES.get(name)
+    if client is None:
+        key_field, secret_field = _KEY_MAP.get(name, ("", ""))
+        await add_exchange(name, CONFIG.get(key_field, ""), CONFIG.get(secret_field, ""))
+        client = _EXCHANGES[name]
+
+    markets = await client.load_markets()
+    _MARKET_CACHE[name] = (now, markets)
+    return markets
+
+
+# ---------------------------------------------------------------------------
+# 5. sync_trading_pairs
 # ---------------------------------------------------------------------------
 async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
     """Ensure all exchanges support the required spot/futures pairs.
@@ -151,18 +197,13 @@ async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
         await notify("Pair sync failed", "mapping missing")
         return {}
 
-    # Load markets concurrently to minimise waiting time.
-    tasks = []
-    for name in exchanges:
-        name = name.lower()
-        client = _EXCHANGES.get(name)
-        if client is None:
-            key_field, secret_field = _KEY_MAP.get(name, ("", ""))
-            await add_exchange(name, CONFIG.get(key_field, ""), CONFIG.get(secret_field, ""))
-            client = _EXCHANGES[name]
-        tasks.append(client.load_markets())
+    # Load markets concurrently, reusing cached results where possible.
+    tasks = {name: asyncio.create_task(get_markets(name.lower())) for name in exchanges}
+    markets_by_exchange: Dict[str, Dict] = {}
     try:
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks.values())
+        for key, markets in zip(tasks.keys(), results):
+            markets_by_exchange[key.lower()] = markets
     except Exception as exc:
         logger.error("Market load failed: %s", exc)
         await notify("Market sync failed", str(exc))
@@ -172,8 +213,7 @@ async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
     for spot_pair, fut_pair in mapping.items():
         missing = []
         for name in exchanges:
-            client = _EXCHANGES[name.lower()]
-            markets = client.markets or {}
+            markets = markets_by_exchange.get(name.lower(), {})
             if spot_pair not in markets or fut_pair not in markets:
                 missing.append(name)
         if missing:
@@ -204,19 +244,52 @@ async def check_exchange_health(exchange_name: str) -> bool:
     try:
         await asyncio.wait_for(client.fetch_time(), timeout=10)
         _last_health[name] = time.time()
+        if name in _OUTAGE_REPORTED:
+            _OUTAGE_REPORTED.discard(name)
         logger.debug("Exchange %s healthy", name)
         return True
     except Exception as exc:
         logger.warning("Health check failed for %s: %s", name, exc)
         await notify("Exchange health failed", f"{name}: {exc}")
         last = _last_health.get(name, 0)
-        if name == "bybit" and time.time() - last > 300:
+        now = time.time()
+        if name == "bybit" and now - last > 300:
             await switch_to_backup_exchange()
+        if now - last > _OUTAGE_THRESHOLD and name not in _OUTAGE_REPORTED:
+            _OUTAGE_REPORTED.add(name)
+            logger.critical("Exchange %s outage detected", name)
+            await notify("Exchange outage", name)
+            await remove_exchange(name)
         return False
 
 
 # ---------------------------------------------------------------------------
-# Optional cleanup utility.
+# 7. remove_exchange
+# ---------------------------------------------------------------------------
+async def remove_exchange(exchange_name: str) -> None:
+    """Remove an exchange client and forget its cached data.
+
+    This is called when an exchange is deemed offline for too long.  Any
+    active designation is cleared so the caller can choose another venue.
+    """
+
+    name = exchange_name.lower()
+    client = _EXCHANGES.pop(name, None)
+    if client:
+        try:
+            await client.close()
+        except Exception:
+            pass
+    _MARKET_CACHE.pop(name, None)
+    _last_health.pop(name, None)
+    global _active_exchange
+    if _active_exchange == name:
+        _active_exchange = None
+    logger.warning("Exchange %s removed due to outage", name)
+
+
+# ---------------------------------------------------------------------------
+# 8. close_all_exchanges
 # ---------------------------------------------------------------------------
 async def close_all_exchanges() -> None:
     """Close all ccxt clients to free network resources."""
