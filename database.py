@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import gzip
+import random
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -54,6 +56,25 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=2)
 # Connection stored globally after :func:`connect_db` runs.
 _DB_CONN: Optional[aiosqlite.Connection] = None
 
+
+async def _get_conn() -> aiosqlite.Connection:
+    """Return an active connection, reconnecting if necessary."""
+    global _DB_CONN
+    if _DB_CONN is None:
+        await connect_db()
+    else:
+        try:
+            await _DB_CONN.execute("SELECT 1")
+        except Exception:
+            try:
+                await _DB_CONN.close()
+            except Exception:
+                pass
+            _DB_CONN = None
+            await connect_db()
+    assert _DB_CONN is not None
+    return _DB_CONN
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -79,24 +100,31 @@ async def _ensure_schema(conn: aiosqlite.Connection) -> None:
 # ---------------------------------------------------------------------------
 # 1. async connect_db
 # ---------------------------------------------------------------------------
-async def connect_db(db_path: str = str(_DB_PATH)) -> None:
+async def connect_db(db_path: str = str(_DB_PATH), retries: int = 3) -> None:
     """Connect to the SQLite database asynchronously.
 
-    It feels like opening our album before adding new stickers.  The connection
-    is stored globally so other functions can reuse it.
+    Like a patient child placing a sticker, we try again with a little delay if
+    the first attempt fails.  The connection is stored globally so other
+    functions can reuse it.
     """
     global _DB_CONN
-    try:
-        _DB_CONN = await aiosqlite.connect(db_path)
-        await _ensure_schema(_DB_CONN)
-        logger.info("Connected to database at %s", db_path)
-    except Exception as exc:
-        logger.error("Database connection failed: %s", exc)
+    delay = 0.1
+    for attempt in range(1, retries + 1):
         try:
-            await notify("Database connection failed", str(exc))
-        except Exception:
-            pass
-        raise
+            _DB_CONN = await aiosqlite.connect(db_path)
+            await _ensure_schema(_DB_CONN)
+            logger.info("Connected to database at %s", db_path)
+            return
+        except Exception as exc:
+            logger.error("Database connection failed (attempt %d/%d): %s", attempt, retries, exc)
+            if attempt == retries:
+                try:
+                    await notify("Database connection failed", str(exc))
+                except Exception:
+                    pass
+                raise
+            await asyncio.sleep(delay + random.random() * 0.1)
+            delay *= 2
 
 
 # ---------------------------------------------------------------------------
@@ -113,40 +141,45 @@ async def save_data(data: List[Dict[str, Any]]) -> None:
     """
     if not validate_data(data):
         return
-    if _DB_CONN is None:
-        await connect_db()
-    assert _DB_CONN is not None  # for type checkers
-    try:
-        await _DB_CONN.executemany(
-            """
-            INSERT INTO trades (
-                timestamp, spot_symbol, futures_symbol,
-                spot_bid, futures_ask, trade_qty, funding_rate
-            ) VALUES (:timestamp, :spot_symbol, :futures_symbol,
-                      :spot_bid, :futures_ask,
-                      :trade_qty, :funding_rate)
-            """,
-            [
-                {
-                    "timestamp": item["timestamp"],
-                    "spot_symbol": item["spot_symbol"],
-                    "futures_symbol": item["futures_symbol"],
-                    "spot_bid": item["spot_bid"],
-                    "futures_ask": item["futures_ask"],
-                    "trade_qty": item.get("trade_qty", 0),
-                    "funding_rate": item.get("funding_rate", 0),
-                }
-                for item in data
-            ],
-        )
-        await _DB_CONN.commit()
-        logger.info("Saved %d rows", len(data))
-    except Exception as exc:
-        logger.error("Failed to save data: %s", exc)
+    delay = 0.1
+    for attempt in range(1, 4):
+        conn = await _get_conn()
         try:
-            await notify("Database write failed", str(exc))
-        except Exception:
-            pass
+            await conn.executemany(
+                """
+                INSERT INTO trades (
+                    timestamp, spot_symbol, futures_symbol,
+                    spot_bid, futures_ask, trade_qty, funding_rate
+                ) VALUES (:timestamp, :spot_symbol, :futures_symbol,
+                          :spot_bid, :futures_ask,
+                          :trade_qty, :funding_rate)
+                """,
+                [
+                    {
+                        "timestamp": item["timestamp"],
+                        "spot_symbol": item["spot_symbol"],
+                        "futures_symbol": item["futures_symbol"],
+                        "spot_bid": item["spot_bid"],
+                        "futures_ask": item["futures_ask"],
+                        "trade_qty": item.get("trade_qty", 0),
+                        "funding_rate": item.get("funding_rate", 0),
+                    }
+                    for item in data
+                ],
+            )
+            await conn.commit()
+            logger.info("Saved %d rows", len(data))
+            return
+        except Exception as exc:
+            logger.error("Failed to save data (attempt %d/3): %s", attempt, exc)
+            if attempt == 3:
+                try:
+                    await notify("Database write failed", str(exc))
+                except Exception:
+                    pass
+                return
+            await asyncio.sleep(delay + random.random() * 0.1)
+            delay *= 2
 
 
 # ---------------------------------------------------------------------------
@@ -157,27 +190,39 @@ async def query_data(
     futures_symbol: str,
     start_date: str,
     end_date: str,
+    min_qty: Optional[float] = None,
+    max_qty: Optional[float] = None,
+    min_funding: Optional[float] = None,
+    max_funding: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Return records for a pair between two dates.
+    """Return records for a pair between two dates with optional filters.
 
-    Dates are ISO strings.  The result is a list of dictionaries ready for
-    pandas or further analysis.
+    Extra parameters allow deeper analysis, letting us peek only at trades that
+    match certain quantity or funding rate ranges.
     """
-    if _DB_CONN is None:
-        await connect_db()
-    assert _DB_CONN is not None
+    conn = await _get_conn()
     try:
-        cursor = await _DB_CONN.execute(
-            """
-            SELECT timestamp, spot_symbol, futures_symbol,
-                   spot_bid, futures_ask, trade_qty, funding_rate
-            FROM trades
-            WHERE spot_symbol = ? AND futures_symbol = ?
-              AND timestamp BETWEEN ? AND ?
-            ORDER BY timestamp
-            """,
-            (spot_symbol, futures_symbol, start_date, end_date),
+        query = (
+            "SELECT timestamp, spot_symbol, futures_symbol, "
+            "spot_bid, futures_ask, trade_qty, funding_rate "
+            "FROM trades WHERE spot_symbol=? AND futures_symbol=? "
+            "AND timestamp BETWEEN ? AND ?"
         )
+        params: List[Any] = [spot_symbol, futures_symbol, start_date, end_date]
+        if min_qty is not None:
+            query += " AND trade_qty >= ?"
+            params.append(min_qty)
+        if max_qty is not None:
+            query += " AND trade_qty <= ?"
+            params.append(max_qty)
+        if min_funding is not None:
+            query += " AND funding_rate >= ?"
+            params.append(min_funding)
+        if max_funding is not None:
+            query += " AND funding_rate <= ?"
+            params.append(max_funding)
+        query += " ORDER BY timestamp"
+        cursor = await conn.execute(query, params)
         rows = await cursor.fetchall()
         cols = [c[0] for c in cursor.description]
         df = pd.DataFrame(rows, columns=cols)
@@ -194,17 +239,33 @@ async def query_data(
 # ---------------------------------------------------------------------------
 # 4. async backup_database
 # ---------------------------------------------------------------------------
-async def backup_database() -> None:
-    """Create a timestamped backup copy of the database file."""
+async def backup_database(compress: bool = True) -> None:
+    """Create a timestamped backup copy of the database file.
+
+    The file is optionally compressed with gzip to save space, and we log its
+    size before copying to avoid surprises.
+    """
     if not _DB_PATH.exists():
         logger.error("Cannot backup: database missing at %s", _DB_PATH)
         await notify("Database backup failed", "missing db file")
         return
+    size_mb = _DB_PATH.stat().st_size / 1_048_576
+    logger.info("Database size %.2f MB", size_mb)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     backup_file = _BACKUP_DIR / f"trades.db.{timestamp}.bak"
     loop = asyncio.get_running_loop()
+
+    def _copy(src: Path, dst: Path) -> None:
+        if compress:
+            with open(src, "rb") as fsrc, gzip.open(dst, "wb") as fdst:
+                shutil.copyfileobj(fsrc, fdst)
+        else:
+            shutil.copy2(src, dst)
+
     try:
-        await loop.run_in_executor(_EXECUTOR, shutil.copy2, _DB_PATH, backup_file)
+        if compress:
+            backup_file = backup_file.with_suffix(backup_file.suffix + ".gz")
+        await loop.run_in_executor(_EXECUTOR, _copy, _DB_PATH, backup_file)
         logger.info("Database backup created at %s", backup_file)
     except Exception as exc:
         logger.error("Database backup failed: %s", exc)
@@ -216,13 +277,11 @@ async def backup_database() -> None:
 # ---------------------------------------------------------------------------
 async def clear_old_data(days: int = 90) -> None:
     """Remove records older than ``days`` days."""
-    if _DB_CONN is None:
-        await connect_db()
-    assert _DB_CONN is not None
+    conn = await _get_conn()
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
     try:
-        await _DB_CONN.execute("DELETE FROM trades WHERE timestamp < ?", (cutoff,))
-        await _DB_CONN.commit()
+        await conn.execute("DELETE FROM trades WHERE timestamp < ?", (cutoff,))
+        await conn.commit()
         logger.info("Old records cleared up to %s", cutoff)
     except Exception as exc:
         logger.error("Failed to clear old data: %s", exc)
@@ -270,11 +329,9 @@ async def fetch_latest_trade(
     spot_symbol: str, futures_symbol: str
 ) -> Optional[Dict[str, Any]]:
     """Return the most recent entry for a given pair."""
-    if _DB_CONN is None:
-        await connect_db()
-    assert _DB_CONN is not None
+    conn = await _get_conn()
     try:
-        cursor = await _DB_CONN.execute(
+        cursor = await conn.execute(
             """
             SELECT timestamp, spot_symbol, futures_symbol, spot_bid,
                    futures_ask, trade_qty, funding_rate
@@ -299,11 +356,9 @@ async def fetch_latest_trade(
 # ---------------------------------------------------------------------------
 async def count_rows() -> int:
     """Return the total number of rows in the trades table."""
-    if _DB_CONN is None:
-        await connect_db()
-    assert _DB_CONN is not None
+    conn = await _get_conn()
     try:
-        cursor = await _DB_CONN.execute("SELECT COUNT(*) FROM trades")
+        cursor = await conn.execute("SELECT COUNT(*) FROM trades")
         (count,) = await cursor.fetchone()
         return int(count)
     except Exception as exc:
