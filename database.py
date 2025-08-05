@@ -48,9 +48,7 @@ except Exception:  # pragma: no cover - fallback
 # Global paths and connection holder
 # ---------------------------------------------------------------------------
 _DB_PATH = Path("data/trades.db")
-_DB_PATH.parent.mkdir(exist_ok=True)
 _BACKUP_DIR = Path("backups")
-_BACKUP_DIR.mkdir(exist_ok=True)
 _EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 # Connection stored globally after :func:`connect_db` runs.
@@ -158,6 +156,7 @@ async def connect_db(db_path: str = str(_DB_PATH), retries: int = 3) -> None:
     functions can reuse it.
     """
     global _DB_CONN
+    Path(db_path).parent.mkdir(exist_ok=True)
     delay = 0.1
     for attempt in range(1, retries + 1):
         try:
@@ -352,8 +351,10 @@ async def backup_database(compress: bool = True) -> None:
     """Create a timestamped backup copy of the database file.
 
     The file is optionally compressed with gzip to save space, and we log its
-    size before copying to avoid surprises.
+    size before copying to avoid surprises.  The destination directory is
+    created lazily to avoid unnecessary I/O during imports.
     """
+    _BACKUP_DIR.mkdir(exist_ok=True)
     if not _DB_PATH.exists():
         logger.error("Cannot backup: database missing at %s", _DB_PATH)
         await notify("Database backup failed", "missing db file")
