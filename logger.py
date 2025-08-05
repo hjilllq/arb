@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from cryptography.fernet import Fernet, InvalidToken
+import atexit
 
 # ---------------------------------------------------------------------------
 # Helper notifier: real notification_manager will replace this later.
@@ -69,41 +70,66 @@ _logger = logging.getLogger("arb.bot")
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-def _has_disk_space(required_mb: int = 1) -> bool:
-    """Check that at least ``required_mb`` of free space is available.
+def _has_disk_space(path: Path | str = _ARCHIVE_DIR, required_mb: int = 1) -> bool:
+    """Ensure ``path`` is writable and has ``required_mb`` free megabytes.
 
-    Warns and sends a notification if disk space is low.  This avoids failed
-    writes when the filesystem is full.
+    The check is conservative: any failure to access the path results in a
+    warning and a ``False`` return value so calling code can bail out early.
+    This helps when logs reside on external or network drives that might be
+    unplugged or temporarily unavailable.
     """
+    p = Path(path)
     try:
-        free_mb = shutil.disk_usage(_ARCHIVE_DIR).free / (1024 * 1024)
-    except OSError:
-        return True  # assume enough space if we cannot determine
+        p.mkdir(parents=True, exist_ok=True)
+        usage = shutil.disk_usage(p)
+    except OSError as exc:
+        try:
+            asyncio.get_running_loop().create_task(
+                notify("Disk unavailable", f"{p}: {exc}")
+            )
+        except RuntimeError:
+            pass
+        return False
+    free_mb = usage.free / (1024 * 1024)
     if free_mb < required_mb:
-        _logger.error("Low disk space: %.1f MB left", free_mb)
         try:
             asyncio.get_running_loop().create_task(
                 notify("Low disk space", f"{free_mb:.1f} MB free")
             )
-        except RuntimeError:  # no running loop
+        except RuntimeError:
             pass
         return False
     return True
 
 
-def _cleanup_old_archives(limit: int = 10) -> None:
-    """Remove old log archives keeping only the newest ``limit`` files."""
+def _cleanup_old_archives(limit: int = 10, max_age_days: int = 30) -> None:
+    """Remove archived logs exceeding ``limit`` or older than ``max_age_days``."""
+    now = datetime.utcnow().timestamp()
+    backups = sorted(
+        _ARCHIVE_DIR.glob("bot.log.*.bak"), key=lambda p: p.stat().st_mtime
+    )
+    for old in backups:
+        age_days = (now - old.stat().st_mtime) / 86400
+        if age_days > max_age_days:
+            try:
+                old.unlink()
+                _logger.info("Expired backup removed: %s", old)
+            except OSError as exc:  # pragma: no cover
+                _logger.warning("Failed to remove backup %s: %s", old, exc)
     backups = sorted(
         _ARCHIVE_DIR.glob("bot.log.*.bak"), key=lambda p: p.stat().st_mtime
     )
     if len(backups) <= limit:
+        _logger.info("Archive cleanup completed: %d files kept", len(backups))
         return
     for old in backups[:-limit]:
         try:
             old.unlink()
             _logger.info("Old backup removed: %s", old)
-        except OSError as exc:  # pragma: no cover - ignore deletion errors
+        except OSError as exc:  # pragma: no cover
             _logger.warning("Failed to remove old backup %s: %s", old, exc)
+    _logger.info("Archive cleanup completed: %d files kept", limit)
+
 
 def _maybe_encrypt(message: str) -> str:
     """Encrypt message if it contains secret words.
@@ -116,6 +142,38 @@ def _maybe_encrypt(message: str) -> str:
     if any(word in lowered for word in ("key", "secret", "token")):
         return encrypt_log(message).decode()
     return message
+
+
+def _log_shutdown() -> None:
+    """Record a final message when the application exits."""
+    try:
+        _logger.info("Logger shutting down")
+    except Exception:
+        pass
+
+
+atexit.register(_log_shutdown)
+
+
+async def _log_with_retry(func, msg: str, retries: int = 1) -> None:
+    """Write a log message with a small retry in case of transient failures."""
+    if not _has_disk_space(_LOG_FILE.parent):
+        await notify("Log write skipped", "Disk unavailable")
+        return
+    loop = asyncio.get_running_loop()
+    for attempt in range(retries + 1):
+        try:
+            await loop.run_in_executor(_EXECUTOR, func, msg)
+            return
+        except Exception as exc:  # pragma: no cover - disk full or permission
+            if attempt < retries:
+                await asyncio.sleep(0.1)
+                continue
+            try:
+                await notify("Log write failed", str(exc))
+            except Exception:
+                pass
+            return
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -181,8 +239,7 @@ async def log_info(message: str) -> None:
     >>> asyncio.run(log_info("Bot started"))  # doctest: +SKIP
     """
     msg = _maybe_encrypt(message)
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(_EXECUTOR, _logger.info, msg)
+    await _log_with_retry(_logger.info, msg, retries=1)
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +248,7 @@ async def log_info(message: str) -> None:
 async def log_warning(message: str) -> None:
     """Record a warning message asynchronously."""
     msg = _maybe_encrypt(message)
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(_EXECUTOR, _logger.warning, msg)
+    await _log_with_retry(_logger.warning, msg, retries=1)
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +265,7 @@ async def log_error(message: str, error: Exception) -> None:
         The exception instance that triggered this log.
     """
     msg = _maybe_encrypt(message)
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(_EXECUTOR, _logger.error, "%s | %s", msg, error)
+    await _log_with_retry(lambda m: _logger.error("%s | %s", m, error), msg)
     try:
         await notify("Error", f"{msg}: {error}")
     except Exception:  # pragma: no cover - notification failure
@@ -229,8 +284,7 @@ async def log_trade(trade: Dict[str, Any]) -> None:
     >>> asyncio.run(log_trade(trade))  # doctest: +SKIP
     """
     msg = _maybe_encrypt(json.dumps(trade, ensure_ascii=False))
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(_EXECUTOR, _logger.info, msg)
+    await _log_with_retry(_logger.info, msg)
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +333,7 @@ async def archive_logs() -> None:
     """Archive the current log file into ``logs_archive`` with a timestamp."""
     if not _LOG_FILE.exists():
         return
-    if not _has_disk_space():
+    if not _has_disk_space(_ARCHIVE_DIR):
         await notify("Archive skipped", "Low disk space")
         return
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -311,7 +365,7 @@ async def clear_logs(max_size_mb: int = 100) -> None:
     if size_mb <= max_size_mb:
         return
     await archive_logs()
-    if not _has_disk_space():
+    if not _has_disk_space(_LOG_FILE.parent):
         await notify("Clear logs skipped", "Low disk space")
         return
     loop = asyncio.get_running_loop()
