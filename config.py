@@ -82,6 +82,10 @@ CONFIG: Dict[str, Any] = {}
 # Executor for tiny background file tasks like backups.
 _EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
+# Cache for threshold JSON files to avoid repeated disk reads when config is
+# reloaded frequently.
+_THRESHOLDS_CACHE: Dict[Path, tuple[float, Dict[str, Any]]] = {}
+
 
 class ConfigError(RuntimeError):
     """Raised when configuration cannot be loaded or is invalid."""
@@ -141,12 +145,20 @@ def load_config(file_path: str = ".env", *, reload: bool = False) -> Dict[str, s
     if thresholds_file:
         # Extra thresholds can live in a neat JSON file.  It keeps the main
         # ``.env`` short and easy to read while still letting an operator tweak
-        # numbers on the fly.
+        # numbers on the fly.  When the file is used repeatedly we keep a small
+        # in-memory cache keyed by file path and modification time so we do not
+        # hit the disk over and over again.
         t_path = Path(thresholds_file)
         if not t_path.is_absolute():
             t_path = env_path.parent / t_path
         try:
-            extra = json.loads(t_path.read_text())
+            mtime = t_path.stat().st_mtime
+            cached = _THRESHOLDS_CACHE.get(t_path)
+            if cached and cached[0] == mtime:
+                extra = cached[1]
+            else:
+                extra = json.loads(t_path.read_text())
+                _THRESHOLDS_CACHE[t_path] = (mtime, extra)
         except Exception as exc:
             logger.error("Threshold file error %s: %s", t_path, exc)
             try:

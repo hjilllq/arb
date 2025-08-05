@@ -2,6 +2,9 @@ import json
 import sys
 import types
 from pathlib import Path
+from datetime import datetime
+import os
+import json
 
 import pytest
 
@@ -79,3 +82,23 @@ def test_update_and_backup(tmp_path, monkeypatch):
     assert 'API_KEY=bar' in env.read_text()
     asyncio.run(config.backup_config())
     assert any(backup_dir.iterdir())
+
+
+def test_backup_cleanup(tmp_path, monkeypatch):
+    env = tmp_path / '.env'
+    env.write_text('API_KEY=foo\n')
+    backup_dir = tmp_path / 'backups'
+    backup_dir.mkdir()
+    monkeypatch.setattr(config, '_ENV_PATH', env)
+    monkeypatch.setattr(config, '_BACKUP_DIR', backup_dir)
+    # allow many backups for first run, then restrict to 1 to test cleanup
+    monkeypatch.setattr(
+        config, 'CONFIG', {'BACKUP_RETENTION_DAYS': 365, 'MAX_BACKUPS': 10, 'API_KEY': 'foo'}
+    )
+    import asyncio
+    asyncio.run(config.backup_config())
+    assert any(backup_dir.glob('*.bak'))
+    config.CONFIG['MAX_BACKUPS'] = 1
+    asyncio.run(config.backup_config())
+    backups = list(backup_dir.glob('*.bak'))
+    assert len(backups) <= 1

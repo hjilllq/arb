@@ -216,7 +216,7 @@ def get_logger(name: str) -> logging.Logger:
 # ---------------------------------------------------------------------------
 # 1. setup_logger
 # ---------------------------------------------------------------------------
-def setup_logger(log_file: str = "bot.log") -> None:
+def setup_logger(log_file: str = "bot.log", level: int | str | None = None) -> None:
     """Configure logging to file and console.
 
     A ``RotatingFileHandler`` splits the main log into numbered pieces while a
@@ -228,12 +228,20 @@ def setup_logger(log_file: str = "bot.log") -> None:
     log_file:
         Where to store log messages.  The default is ``bot.log`` in the project
         root.
+    level:
+        Logging level as ``int`` or name like ``"DEBUG"``.  When ``None`` the
+        value is taken from the ``LOG_LEVEL`` environment variable and defaults
+        to ``INFO``.
     """
     global _LOG_FILE
     _LOG_FILE = Path(log_file)
     _LOG_FILE.touch(exist_ok=True)
 
-    _logger.setLevel(logging.DEBUG)
+    if level is None:
+        level = os.getenv("LOG_LEVEL", "INFO")
+    if isinstance(level, str):
+        level = getattr(logging, level.upper(), logging.INFO)
+    _logger.setLevel(level)
 
     # Clear existing handlers to avoid duplicate logs when reconfiguring.
     _logger.handlers.clear()
