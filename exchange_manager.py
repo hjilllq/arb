@@ -33,6 +33,9 @@ _active_exchange: str | None = None
 _last_health: Dict[str, float] = {}
 # Small cache to avoid reloading markets too often: name -> (timestamp, markets)
 _MARKET_CACHE: Dict[str, tuple[float, Dict]] = {}
+# Small cache for pair synchronization: key (tuple of exchanges) -> (timestamp, mapping)
+_PAIR_CACHE: Dict[tuple[str, ...], tuple[float, Dict[str, str]]] = {}
+_PAIR_TTL = 300  # seconds to reuse pair sync results
 # Track long outages so we don't spam alerts every check
 _OUTAGE_THRESHOLD = 1800  # seconds (30 minutes)
 # Remember when outages were last reported to allow periodic reminders
@@ -170,7 +173,20 @@ async def get_markets(exchange_name: str, ttl: int = 300) -> Dict:
         await add_exchange(name, CONFIG.get(key_field, ""), CONFIG.get(secret_field, ""))
         client = _EXCHANGES[name]
 
-    markets = await client.load_markets()
+    try:
+        markets = await client.load_markets()
+    except ccxt.RateLimitExceeded as exc:
+        logger.warning("Market load rate limited for %s: %s", name, exc)
+        await notify("Rate limit", f"{name}: load_markets")
+        raise
+    except ccxt.NetworkError as exc:
+        logger.warning("Network problem loading markets for %s: %s", name, exc)
+        await notify("Network error", f"{name}: {exc}")
+        raise
+    except ccxt.ExchangeError as exc:
+        logger.error("API error loading markets for %s: %s", name, exc)
+        await notify("Market load failed", f"{name}: {exc}")
+        raise
     _MARKET_CACHE[name] = (now, markets)
     return markets
 
@@ -203,13 +219,27 @@ async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
         await notify("Pair sync failed", "mapping missing")
         return {}
 
+    key = tuple(sorted(name.lower() for name in exchanges))
+    now = time.time()
+    cached = _PAIR_CACHE.get(key)
+    if cached and now - cached[0] < _PAIR_TTL:
+        return cached[1]
+
     # Load markets concurrently, reusing cached results where possible.
     tasks = {name: asyncio.create_task(get_markets(name.lower())) for name in exchanges}
     markets_by_exchange: Dict[str, Dict] = {}
     try:
         results = await asyncio.gather(*tasks.values())
-        for key, markets in zip(tasks.keys(), results):
-            markets_by_exchange[key.lower()] = markets
+        for exch_name, markets in zip(tasks.keys(), results):
+            markets_by_exchange[exch_name.lower()] = markets
+    except ccxt.NetworkError as exc:
+        logger.error("Network error during market sync: %s", exc)
+        await notify("Market sync network error", str(exc))
+        return {}
+    except ccxt.ExchangeError as exc:
+        logger.error("API error during market sync: %s", exc)
+        await notify("Market sync API error", str(exc))
+        return {}
     except Exception as exc:
         logger.error("Market load failed: %s", exc)
         await notify("Market sync failed", str(exc))
@@ -226,6 +256,7 @@ async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
             logger.warning("Pair %s/%s missing on %s", spot_pair, fut_pair, ", ".join(missing))
         else:
             valid_mapping[spot_pair] = fut_pair
+    _PAIR_CACHE[key] = (now, valid_mapping)
     logger.info("Pair sync result: %s", valid_mapping)
     return valid_mapping
 
@@ -260,36 +291,45 @@ async def check_exchange_health(exchange_name: str) -> bool:
         return False
     try:
         await asyncio.wait_for(client.fetch_time(), timeout=10)
+    except ccxt.RateLimitExceeded as exc:
+        err_kind = "rate limit"
+    except (ccxt.NetworkError, asyncio.TimeoutError) as exc:
+        err_kind = "network"
+    except ccxt.ExchangeError as exc:
+        err_kind = "api"
+    except Exception as exc:  # pragma: no cover - unexpected
+        err_kind = "unknown"
+    else:
         _last_health[name] = now
         _FAIL_COUNTS[name] = 0
         if name in _OUTAGE_REPORTED:
             _OUTAGE_REPORTED.discard(name)
         logger.debug("Exchange %s healthy", name)
         return True
-    except Exception as exc:
-        logger.warning("Health check failed for %s: %s", name, exc)
-        await notify("Exchange health failed", f"{name}: {exc}")
-        failures = _FAIL_COUNTS.get(name, 0) + 1
-        _FAIL_COUNTS[name] = failures
-        if failures >= _MAX_FAILURES:
-            logger.error("%s failed %d health checks", name, failures)
-            await notify("Repeated health failures", f"{name} x{failures}")
-            _FAIL_COUNTS[name] = 0
-        last = _last_health.get(name, 0)
-        if name == "bybit" and now - last > 300:
-            await switch_to_backup_exchange()
-        if now - last > _OUTAGE_THRESHOLD:
-            last_alert = _LAST_OUTAGE_ALERT.get(name, 0)
-            if now - last_alert > _OUTAGE_ALERT_INTERVAL:
-                _LAST_OUTAGE_ALERT[name] = now
-                if name not in _OUTAGE_REPORTED:
-                    _OUTAGE_REPORTED.add(name)
-                    logger.critical("Exchange %s outage detected", name)
-                else:
-                    logger.critical("Exchange %s outage persists", name)
-                await notify("Exchange outage", name)
-            await remove_exchange(name)
-        return False
+
+    logger.warning("Health check %s error for %s: %s", err_kind, name, exc)
+    await notify("Exchange health failed", f"{name} ({err_kind}): {exc}")
+    failures = _FAIL_COUNTS.get(name, 0) + 1
+    _FAIL_COUNTS[name] = failures
+    if failures >= _MAX_FAILURES:
+        logger.error("%s failed %d health checks", name, failures)
+        await notify("Repeated health failures", f"{name} x{failures}")
+        _FAIL_COUNTS[name] = 0
+    last = _last_health.get(name, 0)
+    if name == "bybit" and now - last > 300:
+        await switch_to_backup_exchange()
+    if now - last > _OUTAGE_THRESHOLD:
+        last_alert = _LAST_OUTAGE_ALERT.get(name, 0)
+        if now - last_alert > _OUTAGE_ALERT_INTERVAL:
+            _LAST_OUTAGE_ALERT[name] = now
+            if name not in _OUTAGE_REPORTED:
+                _OUTAGE_REPORTED.add(name)
+                logger.critical("Exchange %s outage detected", name)
+            else:
+                logger.critical("Exchange %s outage persists", name)
+            await notify("Exchange outage", name)
+        await remove_exchange(name)
+    return False
 
 
 # ---------------------------------------------------------------------------
