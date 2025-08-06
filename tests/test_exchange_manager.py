@@ -255,7 +255,30 @@ async def test_error_stats(monkeypatch):
     await em.check_exchange_health("bybit")
 
     metrics = em.collect_metrics()
-    assert metrics["error_counts"]["bybit:network"] == 1
+    assert metrics["error_counts"]["bybit"]["network"] == 1
+
+
+def test_metrics_recorder_and_error_stats():
+    class Dummy:
+        def __init__(self):
+            self.errors: list[tuple[str, str]] = []
+
+        def record_health(self, name: str, ts: float) -> None:
+            pass
+
+        def record_latency(self, name: str, latency: float) -> None:
+            pass
+
+        def record_error(self, name: str, kind: str) -> None:
+            self.errors.append((name, kind))
+
+    rec = Dummy()
+    em.set_metrics_recorder(rec)
+    em._record_error("bybit", "network")
+    assert rec.errors == [("bybit", "network")]
+    stats = em.get_error_stats(reset=True)
+    assert stats["bybit"]["network"] == 1
+    assert em.get_error_stats() == {}
 
 
 @pytest.mark.asyncio

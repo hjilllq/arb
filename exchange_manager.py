@@ -11,8 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Awaitable, Callable, Dict, List
-from collections import Counter
+from typing import Awaitable, Callable, Dict, List, Protocol
+from collections import defaultdict
 
 import ccxt.async_support as ccxt
 
@@ -35,24 +35,52 @@ from logger import get_logger
 # manager can run in very lightweight environments.  When installed a tiny HTTP
 # server can be started to expose runtime metrics for systems such as Grafana or
 # Prometheus.
+class MetricsRecorder(Protocol):
+    """Small interface for reporting optional runtime metrics."""
+
+    def record_health(self, name: str, timestamp: float) -> None:  # pragma: no cover - interface only
+        ...
+
+    def record_latency(self, name: str, latency: float) -> None:  # pragma: no cover - interface only
+        ...
+
+    def record_error(self, name: str, kind: str) -> None:  # pragma: no cover - interface only
+        ...
+
+
 try:  # pragma: no cover - metrics optional in tests
     from prometheus_client import Counter, Gauge, start_http_server
 
-    _PROM_HEALTH = Gauge(
-        "exchange_last_health_seconds",
-        "Unix timestamp of the last successful health check",
-        ["exchange"],
-    )
-    _PROM_LATENCY = Gauge(
-        "exchange_latency_seconds",
-        "Latency of the last health check",
-        ["exchange"],
-    )
-    _PROM_ERRORS = Counter(
-        "exchange_errors_total",
-        "Number of API/health errors grouped by exchange and type",
-        ["exchange", "type"],
-    )
+    class _PromMetrics:
+        """Prometheus-backed metrics recorder."""
+
+        def __init__(self) -> None:
+            self._health = Gauge(
+                "exchange_last_health_seconds",
+                "Unix timestamp of the last successful health check",
+                ["exchange"],
+            )
+            self._latency = Gauge(
+                "exchange_latency_seconds",
+                "Latency of the last health check",
+                ["exchange"],
+            )
+            self._errors = Counter(
+                "exchange_errors_total",
+                "Number of API/health errors grouped by exchange and type",
+                ["exchange", "type"],
+            )
+
+        def record_health(self, name: str, timestamp: float) -> None:
+            self._health.labels(name).set(timestamp)
+
+        def record_latency(self, name: str, latency: float) -> None:
+            self._latency.labels(name).set(latency)
+
+        def record_error(self, name: str, kind: str) -> None:
+            self._errors.labels(name, kind).inc()
+
+    _METRICS: MetricsRecorder = _PromMetrics()
 
     def start_metrics_server(port: int = 8000) -> None:
         """Start an HTTP server exposing Prometheus metrics."""
@@ -60,12 +88,32 @@ try:  # pragma: no cover - metrics optional in tests
         start_http_server(port)
 
 except Exception:  # pragma: no cover - library missing
-    _PROM_HEALTH = _PROM_LATENCY = _PROM_ERRORS = None
+
+    class _NullMetrics:
+        """Fallback recorder when no metrics backend is available."""
+
+        def record_health(self, name: str, timestamp: float) -> None:  # pragma: no cover - simple
+            pass
+
+        def record_latency(self, name: str, latency: float) -> None:  # pragma: no cover - simple
+            pass
+
+        def record_error(self, name: str, kind: str) -> None:  # pragma: no cover - simple
+            pass
+
+    _METRICS: MetricsRecorder = _NullMetrics()
 
     def start_metrics_server(port: int = 8000) -> None:
         """Fallback when :mod:`prometheus_client` is not available."""
 
         logger.info("Prometheus client not installed; metrics disabled")
+
+
+def set_metrics_recorder(recorder: MetricsRecorder) -> None:
+    """Inject a custom metrics recorder (e.g. StatsD, OpenTelemetry)."""
+
+    global _METRICS
+    _METRICS = recorder
 
 try:  # pragma: no cover - notifier provided in real project
     from notification_manager import notify  # type: ignore
@@ -113,7 +161,10 @@ _REQUEST_LIMIT = get_exchange_request_limit()
 _RATE_LIMITERS: Dict[str, asyncio.Semaphore] = {}
 
 # Error counters grouped by exchange and error type for production monitoring.
-_ERROR_STATS: Counter = Counter()
+# Error counters grouped by exchange and error type for production monitoring.
+# ``defaultdict`` keeps memory usage small even with many exchanges and allows
+# quick reset when metrics are scraped.
+_ERROR_STATS: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
 # Optional listeners notified whenever a health check completes.  Each callback
 # receives ``(exchange_name, healthy, info)`` where ``info`` is a short string
@@ -177,10 +228,17 @@ def _rate_limiter(name: str) -> asyncio.Semaphore:
 def _record_error(name: str, kind: str) -> None:
     """Aggregate error ``kind`` for ``name`` and update metrics."""
 
-    key = f"{name}:{kind}"
-    _ERROR_STATS[key] += 1
-    if _PROM_ERRORS:
-        _PROM_ERRORS.labels(name, kind).inc()
+    _ERROR_STATS[name][kind] += 1
+    _METRICS.record_error(name, kind)
+
+
+def get_error_stats(reset: bool = False) -> Dict[str, Dict[str, int]]:
+    """Return a copy of error counters and optionally clear them."""
+
+    stats = {ex: dict(types) for ex, types in _ERROR_STATS.items()}
+    if reset:
+        _ERROR_STATS.clear()
+    return stats
 
 
 def register_health_listener(
@@ -237,15 +295,30 @@ async def monitor_rate_limits(threshold: float | None = None) -> Dict[str, int]:
 
 
 async def _call_with_retries(
-    func: Callable[[], Awaitable], name: str, action: str, *, detail: str = ""
+    func: Callable[[], Awaitable],
+    name: str,
+    action: str,
+    *,
+    detail: str = "",
+    retries: int | None = None,
+    delay: float | None = None,
 ):
     """Run ``func`` with retries for network and rate limit errors.
 
     ``detail`` can supply contextual information such as the affected symbol, so
     production logs and monitoring systems receive richer diagnostics.
+
+    Parameters
+    ----------
+    retries, delay:
+        Override the global retry policy.  ``delay`` grows exponentially after
+        each attempt to reduce load during outages.
     """
 
-    for attempt in range(1, _DEFAULT_RETRIES + 1):
+    retries = retries or _DEFAULT_RETRIES
+    delay = delay or _RETRY_DELAY
+
+    for attempt in range(1, retries + 1):
         start = time.perf_counter()
         try:
             return await func()
@@ -254,7 +327,7 @@ async def _call_with_retries(
             err_type = type(exc).__name__
             _record_error(name, err_type)
             extra = f" {detail}" if detail else ""
-            if attempt == _DEFAULT_RETRIES:
+            if attempt == retries:
                 logger.error(
                     "%s failed for %s after %d attempts (%s, %.3fs)%s: %s",
                     action,
@@ -272,19 +345,19 @@ async def _call_with_retries(
                 action,
                 name,
                 attempt,
-                _DEFAULT_RETRIES,
+                retries,
                 err_type,
                 elapsed,
                 extra,
                 exc,
             )
-            await asyncio.sleep(_RETRY_DELAY)
+            await asyncio.sleep(delay * 2 ** (attempt - 1))
         except Exception as exc:  # pragma: no cover - unexpected
             elapsed = time.perf_counter() - start
             err_type = type(exc).__name__
             _record_error(name, err_type)
             extra = f" {detail}" if detail else ""
-            if attempt == _DEFAULT_RETRIES:
+            if attempt == retries:
                 logger.error(
                     "%s unexpected failure for %s after %d attempts (%s, %.3fs)%s: %s",
                     action,
@@ -302,13 +375,13 @@ async def _call_with_retries(
                 action,
                 name,
                 attempt,
-                _DEFAULT_RETRIES,
+                retries,
                 err_type,
                 elapsed,
                 extra,
                 exc,
             )
-            await asyncio.sleep(_RETRY_DELAY)
+            await asyncio.sleep(delay * 2 ** (attempt - 1))
 
 
 async def _get_client_for_exchange(name: str) -> ccxt.Exchange:
@@ -347,8 +420,7 @@ async def _probe_exchange(name: str) -> float | None:
 
     latency = time.perf_counter() - start
     _PING_TIMES[name] = latency
-    if _PROM_LATENCY:
-        _PROM_LATENCY.labels(name).set(latency)
+    _METRICS.record_latency(name, latency)
     return latency
 
 
@@ -676,8 +748,7 @@ async def check_exchange_health(exchange_name: str) -> bool:
             )
         latency = time.perf_counter() - start
         _PING_TIMES[name] = latency
-        if _PROM_LATENCY:
-            _PROM_LATENCY.labels(name).set(latency)
+        _METRICS.record_latency(name, latency)
     except RateLimitExceeded as exc:
         err_kind = "rate limit"
         err = exc
@@ -695,8 +766,7 @@ async def check_exchange_health(exchange_name: str) -> bool:
         _FAIL_COUNTS[name] = 0
         if name in _OUTAGE_REPORTED:
             _OUTAGE_REPORTED.discard(name)
-        if _PROM_HEALTH:
-            _PROM_HEALTH.labels(name).set(now)
+        _METRICS.record_health(name, now)
         logger.info("Exchange %s healthy (%.3fs)", name, latency)
         await _fire_health_event(name, True)
         if name == _active_exchange and _active_exchange != _PRIMARY:
@@ -805,5 +875,5 @@ def collect_metrics() -> Dict[str, Dict[str, float | int | str]]:
         "last_health": dict(_last_health),
         "fail_counts": dict(_FAIL_COUNTS),
         "latency": dict(_PING_TIMES),
-        "error_counts": dict(_ERROR_STATS),
+        "error_counts": {ex: dict(kinds) for ex, kinds in _ERROR_STATS.items()},
     }
