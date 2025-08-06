@@ -55,17 +55,18 @@ _PAIR_TTL_MIN = int(CONFIG.get("PAIR_TTL_MIN", 60))
 _PAIR_TTL_MAX = int(CONFIG.get("PAIR_TTL_MAX", 900))
 _PAIR_TTL_STEP = int(CONFIG.get("PAIR_TTL_STEP", 60))
 _PAIR_TTLS: Dict[tuple[str, ...], int] = {}
-# Track long outages so we don't spam alerts every check
-_OUTAGE_THRESHOLD = 1800  # seconds (30 minutes)
+# Track long outages so we don't spam alerts every check.  All thresholds are
+# configurable via the environment so operators can tune alerting.
+_OUTAGE_THRESHOLD = int(CONFIG.get("OUTAGE_THRESHOLD", 1800))
 # Remember when outages were last reported to allow periodic reminders
 _OUTAGE_REPORTED: set[str] = set()
-_OUTAGE_ALERT_INTERVAL = 3600  # seconds (1 hour between outage alerts)
+_OUTAGE_ALERT_INTERVAL = int(CONFIG.get("OUTAGE_ALERT_INTERVAL", 3600))
 _LAST_OUTAGE_ALERT: Dict[str, float] = {}
 # Count consecutive health check failures per exchange
 _FAIL_COUNTS: Dict[str, int] = {}
-_MAX_FAILURES = 5  # consecutive failures before extra notification
+_MAX_FAILURES = int(CONFIG.get("HEALTH_FAILURE_THRESHOLD", 5))
 # Switch after a few consecutive failures even if total downtime is short
-_FAIL_SWITCH = 3
+_FAIL_SWITCH = int(CONFIG.get("HEALTH_SWITCH_FAILURES", 3))
 _SWITCH_TIMEOUT = get_switch_backup_timeout()
 
 # Retry and rate-limit settings for graceful recovery under load.
@@ -73,6 +74,11 @@ _DEFAULT_RETRIES = get_request_retries()
 _RETRY_DELAY = get_request_retry_delay()
 _REQUEST_LIMIT = get_exchange_request_limit()
 _RATE_LIMITERS: Dict[str, asyncio.Semaphore] = {}
+
+# Optional listeners notified whenever a health check completes.  Each callback
+# receives ``(exchange_name, healthy, info)`` where ``info`` is a short string
+# describing the error type on failure.
+_HEALTH_LISTENERS: List[Callable[[str, bool, str], Awaitable[None]]] = []
 
 # Helper mapping from logical names to config keys for API credentials.
 _KEY_MAP = {
@@ -113,19 +119,47 @@ def _rate_limiter(name: str) -> asyncio.Semaphore:
     return sem
 
 
-async def monitor_rate_limits(threshold: float = 0.8) -> Dict[str, int]:
+def register_health_listener(
+    callback: Callable[[str, bool, str], Awaitable[None]]
+) -> None:
+    """Register ``callback`` to receive health events.
+
+    The callback is awaited with ``(exchange_name, healthy, info)`` where
+    ``info`` provides a short error category such as ``"network"``.
+    """
+
+    _HEALTH_LISTENERS.append(callback)
+
+
+async def _fire_health_event(name: str, healthy: bool, info: str = "") -> None:
+    """Invoke all registered health listeners safely."""
+
+    if not _HEALTH_LISTENERS:
+        return
+    for cb in list(_HEALTH_LISTENERS):
+        try:
+            await cb(name, healthy, info)
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            logger.error("Health listener failed: %s", exc)
+
+
+async def monitor_rate_limits(threshold: float | None = None) -> Dict[str, int]:
     """Report remaining request slots and warn on heavy usage.
 
     Parameters
     ----------
     threshold:
-        Fraction of the limit in use before a warning is emitted.
+        Fraction of the limit in use before a warning is emitted.  If ``None``,
+        ``RATE_ALERT_THRESHOLD`` from :mod:`config` is used.
 
     Returns
     -------
     dict
         Mapping of exchange names to remaining slots.
     """
+
+    if threshold is None:
+        threshold = float(CONFIG.get("RATE_ALERT_THRESHOLD", 0.8))
 
     status: Dict[str, int] = {}
     for name, sem in _RATE_LIMITERS.items():
@@ -147,22 +181,48 @@ async def _call_with_retries(
         try:
             return await func()
         except (RateLimitExceeded, NetworkError, ExchangeError) as exc:
+            err_type = type(exc).__name__
             if attempt == _DEFAULT_RETRIES:
                 logger.error(
-                    "%s failed for %s after %d attempts: %s",
+                    "%s failed for %s after %d attempts (%s): %s",
                     action,
                     name,
                     attempt,
+                    err_type,
                     exc,
                 )
                 await notify(f"{action} failed", f"{name}: {exc}")
                 raise
             logger.warning(
-                "%s error for %s (attempt %d/%d): %s",
+                "%s error for %s (attempt %d/%d, %s): %s",
                 action,
                 name,
                 attempt,
                 _DEFAULT_RETRIES,
+                err_type,
+                exc,
+            )
+            await asyncio.sleep(_RETRY_DELAY)
+        except Exception as exc:  # pragma: no cover - unexpected
+            err_type = type(exc).__name__
+            if attempt == _DEFAULT_RETRIES:
+                logger.error(
+                    "%s unexpected failure for %s after %d attempts (%s): %s",
+                    action,
+                    name,
+                    attempt,
+                    err_type,
+                    exc,
+                )
+                await notify(f"{action} failed", f"{name}: {exc}")
+                raise
+            logger.warning(
+                "%s unexpected error for %s (attempt %d/%d, %s): %s",
+                action,
+                name,
+                attempt,
+                _DEFAULT_RETRIES,
+                err_type,
                 exc,
             )
             await asyncio.sleep(_RETRY_DELAY)
@@ -311,6 +371,11 @@ async def get_markets(exchange_name: str, ttl: int = 300) -> Dict:
     async with _rate_limiter(name):
         markets = await _call_with_retries(client.load_markets, name, "load_markets")
 
+    if not isinstance(markets, dict) or not markets:
+        logger.error("%s returned invalid markets payload: %r", name, markets)
+        await notify("Invalid market data", f"{name} returned {type(markets).__name__}")
+        raise ExchangeError("invalid markets payload")
+
     _MARKET_CACHE[name] = (now, markets)
     return markets
 
@@ -455,6 +520,7 @@ async def check_exchange_health(exchange_name: str) -> bool:
         if name in _OUTAGE_REPORTED:
             _OUTAGE_REPORTED.discard(name)
         logger.debug("Exchange %s healthy", name)
+        await _fire_health_event(name, True)
         return True
 
     failures = _FAIL_COUNTS.get(name, 0) + 1
@@ -486,6 +552,7 @@ async def check_exchange_health(exchange_name: str) -> bool:
             await notify("Exchange outage", f"{name} down {minutes}m")
         logger.error("Removing %s after %d min offline", name, minutes)
         await remove_exchange(name, downtime)
+    await _fire_health_event(name, False, err_kind)
     return False
 
 

@@ -36,6 +36,7 @@ def reset_state():
     em._PAIR_CACHE.clear()
     em._PAIR_TTLS.clear()
     em._RATE_LIMITERS.clear()
+    em._HEALTH_LISTENERS.clear()
     em._RETRY_DELAY = 0
     em._DEFAULT_RETRIES = 1
     yield
@@ -159,3 +160,50 @@ async def test_monitor_rate_limits_warns(monkeypatch):
 
     assert status["bybit"] == 1
     assert notified.get("msg") == "Rate limit high"
+
+
+@pytest.mark.asyncio
+async def test_monitor_rate_limits_uses_config(monkeypatch):
+    """Default threshold comes from configuration when not supplied."""
+
+    notified = {}
+
+    async def fake_notify(msg, detail=""):
+        notified["msg"] = msg
+
+    monkeypatch.setattr(em, "notify", fake_notify)
+    em.CONFIG["RATE_ALERT_THRESHOLD"] = 0.1
+    em._REQUEST_LIMIT = 2
+    sem = em._rate_limiter("bybit")
+
+    async with sem:
+        await em.monitor_rate_limits()
+
+    assert notified.get("msg") == "Rate limit high"
+
+
+@pytest.mark.asyncio
+async def test_health_listener_called(monkeypatch):
+    events = []
+
+    async def listener(name, healthy, info):
+        events.append((name, healthy, info))
+
+    em.register_health_listener(listener)
+
+    monkeypatch.setattr(ccxt, "bybit", lambda config=None: DummyClient())
+    await em.add_exchange("bybit", "k", "s")
+
+    em._last_health["bybit"] = time.time()
+    await em.check_exchange_health("bybit")
+
+    assert events and events[0] == ("bybit", True, "")
+
+
+@pytest.mark.asyncio
+async def test_get_markets_invalid_payload(monkeypatch):
+    client = DummyClient(markets=None)
+    em._EXCHANGES["bybit"] = client
+
+    with pytest.raises(em.ExchangeError):
+        await em.get_markets("bybit", ttl=0)
