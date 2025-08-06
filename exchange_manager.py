@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, List, Protocol
 from collections import defaultdict
 
@@ -123,12 +124,26 @@ except Exception:  # pragma: no cover - fallback for early development
 
 logger = get_logger(__name__)
 
+@dataclass(slots=True)
+class ExchangeState:
+    """Small container for per-exchange data.
+
+    Using ``__slots__`` keeps per-exchange memory usage tiny even when dozens of
+    venues are tracked simultaneously.
+    """
+
+    client: ccxt.Exchange | None
+    last_health: float = 0.0
+    fail_count: int = 0
+    rate_limiter: asyncio.Semaphore | None = None
+    ping: float = 0.0
+
+
 # ---------------------------------------------------------------------------
 # Internal state containers.
 # ---------------------------------------------------------------------------
-_EXCHANGES: Dict[str, ccxt.Exchange] = {}
+_STATES: Dict[str, ExchangeState] = {}
 _active_exchange: str | None = None
-_last_health: Dict[str, float] = {}
 # Small cache to avoid reloading markets too often: name -> (timestamp, markets)
 _MARKET_CACHE: Dict[str, tuple[float, Dict]] = {}
 # Small cache for pair synchronization: key (tuple of exchanges) -> (timestamp, mapping)
@@ -147,8 +162,6 @@ _OUTAGE_THRESHOLD = int(CONFIG.get("OUTAGE_THRESHOLD", 1800))
 _OUTAGE_REPORTED: set[str] = set()
 _OUTAGE_ALERT_INTERVAL = int(CONFIG.get("OUTAGE_ALERT_INTERVAL", 3600))
 _LAST_OUTAGE_ALERT: Dict[str, float] = {}
-# Count consecutive health check failures per exchange
-_FAIL_COUNTS: Dict[str, int] = {}
 _MAX_FAILURES = int(CONFIG.get("HEALTH_FAILURE_THRESHOLD", 5))
 # Switch after a few consecutive failures even if total downtime is short
 _FAIL_SWITCH = int(CONFIG.get("HEALTH_SWITCH_FAILURES", 3))
@@ -158,9 +171,7 @@ _SWITCH_TIMEOUT = get_switch_backup_timeout()
 _DEFAULT_RETRIES = get_request_retries()
 _RETRY_DELAY = get_request_retry_delay()
 _REQUEST_LIMIT = get_exchange_request_limit()
-_RATE_LIMITERS: Dict[str, asyncio.Semaphore] = {}
 
-# Error counters grouped by exchange and error type for production monitoring.
 # Error counters grouped by exchange and error type for production monitoring.
 # ``defaultdict`` keeps memory usage small even with many exchanges and allows
 # quick reset when metrics are scraped.
@@ -177,19 +188,19 @@ _KEY_MAP = {
     "binance": ("BACKUP_API_KEY", "BACKUP_API_SECRET"),
 }
 
-# Track measured latency of the last successful health check per exchange.  These
-# values are also exposed via Prometheus gauges when available.
-_PING_TIMES: Dict[str, float] = {}
-
 # Primary exchange to which the bot prefers to connect.  Backup exchanges will be
 # used only when the primary is considered unhealthy.
 _PRIMARY = str(CONFIG.get("PRIMARY_EXCHANGE", "bybit")).lower()
 
 # Parameters governing how often we attempt to reconnect to the primary exchange
-# once a failover occurred.  ``_RECONNECT_DELAY`` starts small and is doubled
-# after each failed attempt until ``_RECONNECT_MAX_DELAY``.
+# once a failover occurred.  ``_RECONNECT_DELAY`` starts small and grows by a
+# configurable factor after each failed attempt.  ``_RECONNECT_DECAY`` allows the
+# factor to scale with the time since the last healthy probe so operators can
+# reduce or increase pressure dynamically.
 _RECONNECT_DELAY = int(CONFIG.get("RECONNECT_DELAY", 300))
 _RECONNECT_MAX_DELAY = int(CONFIG.get("RECONNECT_MAX_DELAY", 3600))
+_RECONNECT_FACTOR = float(CONFIG.get("RECONNECT_FACTOR", 2.0))
+_RECONNECT_DECAY = int(CONFIG.get("RECONNECT_DECAY", 3600))
 _NEXT_RECONNECT: float = 0.0
 
 
@@ -218,10 +229,15 @@ def _get_backup_candidates() -> List[str]:
 def _rate_limiter(name: str) -> asyncio.Semaphore:
     """Return a semaphore limiting concurrent requests for ``name``."""
 
-    sem = _RATE_LIMITERS.get(name)
+    state = _STATES.get(name)
+    if state is None:
+        state = ExchangeState(client=None, rate_limiter=asyncio.Semaphore(_REQUEST_LIMIT))
+        _STATES[name] = state
+        return state.rate_limiter  # type: ignore[return-value]
+    sem = state.rate_limiter
     if sem is None:
         sem = asyncio.Semaphore(_REQUEST_LIMIT)
-        _RATE_LIMITERS[name] = sem
+        state.rate_limiter = sem
     return sem
 
 
@@ -284,7 +300,10 @@ async def monitor_rate_limits(threshold: float | None = None) -> Dict[str, int]:
         threshold = float(CONFIG.get("RATE_ALERT_THRESHOLD", 0.8))
 
     status: Dict[str, int] = {}
-    for name, sem in _RATE_LIMITERS.items():
+    for name, state in _STATES.items():
+        sem = state.rate_limiter
+        if sem is None:
+            continue
         remaining = sem._value
         status[name] = remaining
         used = _REQUEST_LIMIT - remaining
@@ -386,11 +405,14 @@ async def _call_with_retries(
 
 async def _get_client_for_exchange(name: str) -> ccxt.Exchange:
     """Return a ccxt client for ``name`` creating it on demand."""
-    client = _EXCHANGES.get(name)
+
+    state = _STATES.get(name)
+    client = state.client if state else None
     if client is None:
         key_field, secret_field = _KEY_MAP.get(name, ("", ""))
         await add_exchange(name, CONFIG.get(key_field, ""), CONFIG.get(secret_field, ""))
-        client = _EXCHANGES[name]
+        state = _STATES[name]
+        client = state.client  # type: ignore[assignment]
     return client
 
 
@@ -398,8 +420,8 @@ async def _probe_exchange(name: str) -> float | None:
     """Measure ``fetch_time`` latency for ``name``.
 
     A ``None`` result indicates that the exchange is unreachable.  Latencies are
-    recorded in ``_PING_TIMES`` and, if Prometheus metrics are enabled, updated
-    in the corresponding gauges.
+    stored in the per-exchange state and, if Prometheus metrics are enabled,
+    updated in the corresponding gauges.
     """
 
     try:
@@ -419,7 +441,9 @@ async def _probe_exchange(name: str) -> float | None:
         return None
 
     latency = time.perf_counter() - start
-    _PING_TIMES[name] = latency
+    state = _STATES.get(name)
+    if state:
+        state.ping = latency
     _METRICS.record_latency(name, latency)
     return latency
 
@@ -464,8 +488,11 @@ async def add_exchange(exchange_name: str, api_key: str, api_secret: str) -> Non
                 "options": {"defaultType": "spot"},
             }
         )
-        _EXCHANGES[name] = client
-        _last_health.setdefault(name, 0.0)
+        state = ExchangeState(
+            client=client,
+            rate_limiter=asyncio.Semaphore(_REQUEST_LIMIT),
+        )
+        _STATES[name] = state
         global _active_exchange
         if _active_exchange is None:
             _active_exchange = name
@@ -518,7 +545,8 @@ async def _maybe_reconnect_primary() -> bool:
     """Attempt to reconnect to the primary exchange if the backoff period passed.
 
     Returns ``True`` if the primary became active.  The delay between attempts
-    grows exponentially up to ``_RECONNECT_MAX_DELAY``.
+    grows by ``RECONNECT_FACTOR`` after each failure and scales with the time
+    since the last healthy probe using ``RECONNECT_DECAY``.
     """
 
     global _active_exchange, _RECONNECT_DELAY, _NEXT_RECONNECT
@@ -535,6 +563,9 @@ async def _maybe_reconnect_primary() -> bool:
         old = _active_exchange
         _active_exchange = _PRIMARY
         _RECONNECT_DELAY = int(CONFIG.get("RECONNECT_DELAY", 300))
+        state = _STATES.get(_PRIMARY)
+        if state:
+            state.last_health = now
         logger.warning(
             "Reconnected to primary %s from %s (latency %.3fs)",
             _PRIMARY,
@@ -543,7 +574,13 @@ async def _maybe_reconnect_primary() -> bool:
         )
         return True
 
-    _RECONNECT_DELAY = min(_RECONNECT_DELAY * 2, _RECONNECT_MAX_DELAY)
+    state = _STATES.get(_PRIMARY)
+    last = state.last_health if state else 0
+    downtime = now - last
+    growth = _RECONNECT_FACTOR
+    if _RECONNECT_DECAY > 0:
+        growth += downtime / _RECONNECT_DECAY
+    _RECONNECT_DELAY = min(int(_RECONNECT_DELAY * growth), _RECONNECT_MAX_DELAY)
     _NEXT_RECONNECT = now + _RECONNECT_DELAY
     logger.error(
         "Primary %s still unreachable; next retry in %ds",
@@ -599,11 +636,13 @@ async def get_markets(exchange_name: str, ttl: int = 300) -> Dict:
     if cached and now - cached[0] < ttl:
         return cached[1]
 
-    client = _EXCHANGES.get(name)
+    state = _STATES.get(name)
+    client = state.client if state else None
     if client is None:
         key_field, secret_field = _KEY_MAP.get(name, ("", ""))
         await add_exchange(name, CONFIG.get(key_field, ""), CONFIG.get(secret_field, ""))
-        client = _EXCHANGES[name]
+        state = _STATES[name]
+        client = state.client  # type: ignore[assignment]
 
     async with _rate_limiter(name):
         markets = await _call_with_retries(
@@ -722,10 +761,11 @@ async def check_exchange_health(exchange_name: str) -> bool:
 
     name = exchange_name.lower()
     now = time.time()
-    client = _EXCHANGES.get(name)
+    state = _STATES.get(name)
+    client = state.client if state else None
     if client is None:
         # Even if removed, keep reminding operators about persistent outages
-        last = _last_health.get(name, 0)
+        last = state.last_health if state else 0
         downtime = now - last
         if downtime > _OUTAGE_THRESHOLD:
             last_alert = _LAST_OUTAGE_ALERT.get(name, 0)
@@ -747,7 +787,8 @@ async def check_exchange_health(exchange_name: str) -> bool:
                 timeout=10,
             )
         latency = time.perf_counter() - start
-        _PING_TIMES[name] = latency
+        if state:
+            state.ping = latency
         _METRICS.record_latency(name, latency)
     except RateLimitExceeded as exc:
         err_kind = "rate limit"
@@ -762,8 +803,9 @@ async def check_exchange_health(exchange_name: str) -> bool:
         err_kind = "unknown"
         err = exc
     else:
-        _last_health[name] = now
-        _FAIL_COUNTS[name] = 0
+        if state:
+            state.last_health = now
+            state.fail_count = 0
         if name in _OUTAGE_REPORTED:
             _OUTAGE_REPORTED.discard(name)
         _METRICS.record_health(name, now)
@@ -773,10 +815,11 @@ async def check_exchange_health(exchange_name: str) -> bool:
             await _maybe_reconnect_primary()
         return True
 
-    failures = _FAIL_COUNTS.get(name, 0) + 1
-    _FAIL_COUNTS[name] = failures
+    failures = (state.fail_count if state else 0) + 1
+    if state:
+        state.fail_count = failures
     _record_error(name, err_kind)
-    last = _last_health.get(name, 0)
+    last = state.last_health if state else 0
     downtime = now - last
     logger.warning(
         "Health check %s error for %s (failure %d, downtime %.1fs): %s",
@@ -790,10 +833,12 @@ async def check_exchange_health(exchange_name: str) -> bool:
     if failures >= _MAX_FAILURES:
         logger.error("%s failed %d health checks", name, failures)
         await notify("Repeated health failures", f"{name} x{failures}")
-        _FAIL_COUNTS[name] = 0
+        if state:
+            state.fail_count = 0
     if name == "bybit" and _active_exchange == "bybit":
         if now - last > _SWITCH_TIMEOUT or failures >= _FAIL_SWITCH:
-            _FAIL_COUNTS[name] = 0
+            if state:
+                state.fail_count = 0
             await switch_to_backup_exchange()
     downtime = now - last
     if downtime > _OUTAGE_THRESHOLD:
@@ -831,14 +876,15 @@ async def remove_exchange(exchange_name: str, downtime: float | None = None) -> 
     """
 
     name = exchange_name.lower()
-    client = _EXCHANGES.pop(name, None)
+    state = _STATES.pop(name, None)
+    client = state.client if state else None
     if client:
         try:
             await client.close()
         except Exception:
             pass
     _MARKET_CACHE.pop(name, None)
-    # keep _last_health so later checks know how long we've been offline
+    # keep state.last_health so later checks know how long we've been offline
     global _active_exchange
     if _active_exchange == name:
         _active_exchange = None
@@ -854,12 +900,14 @@ async def remove_exchange(exchange_name: str, downtime: float | None = None) -> 
 async def close_all_exchanges() -> None:
     """Close all ccxt clients to free network resources."""
 
-    for client in _EXCHANGES.values():
-        try:
-            await client.close()
-        except Exception:
-            pass
-    _EXCHANGES.clear()
+    for state in _STATES.values():
+        client = state.client
+        if client:
+            try:
+                await client.close()
+            except Exception:
+                pass
+    _STATES.clear()
 
 
 def collect_metrics() -> Dict[str, Dict[str, float | int | str]]:
@@ -872,8 +920,8 @@ def collect_metrics() -> Dict[str, Dict[str, float | int | str]]:
 
     return {
         "active_exchange": _active_exchange or "",
-        "last_health": dict(_last_health),
-        "fail_counts": dict(_FAIL_COUNTS),
-        "latency": dict(_PING_TIMES),
+        "last_health": {n: s.last_health for n, s in _STATES.items()},
+        "fail_counts": {n: s.fail_count for n, s in _STATES.items()},
+        "latency": {n: s.ping for n, s in _STATES.items()},
         "error_counts": {ex: dict(kinds) for ex, kinds in _ERROR_STATS.items()},
     }

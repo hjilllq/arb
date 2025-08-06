@@ -5,7 +5,7 @@ import time
 import pytest
 
 import exchange_manager as em
-from exchange_manager import ccxt
+from exchange_manager import ccxt, ExchangeState
 
 
 class DummyClient:
@@ -30,20 +30,17 @@ class DummyClient:
 @pytest.fixture(autouse=True)
 def reset_state():
     original_config = dict(em.CONFIG)
-    em._EXCHANGES.clear()
+    em._STATES.clear()
     em._active_exchange = None
-    em._last_health.clear()
     em._MARKET_CACHE.clear()
     em._PAIR_CACHE.clear()
     em._PAIR_TTLS.clear()
-    em._RATE_LIMITERS.clear()
     em._HEALTH_LISTENERS.clear()
-    em._FAIL_COUNTS.clear()
     em._ERROR_STATS.clear()
     em._RETRY_DELAY = 0
     em._DEFAULT_RETRIES = 1
     yield
-    em._EXCHANGES.clear()
+    em._STATES.clear()
     em.CONFIG.clear()
     em.CONFIG.update(original_config)
 
@@ -80,7 +77,7 @@ async def test_check_exchange_health_switches(monkeypatch):
 
     await em.add_exchange("bybit", "k", "s")
     await em.add_exchange("binance", "k", "s")
-    em._last_health["bybit"] = time.time() - 400
+    em._STATES["bybit"].last_health = time.time() - 400
 
     ok = await em.check_exchange_health("bybit")
     assert not ok
@@ -94,7 +91,7 @@ async def test_failure_count_triggers_switch(monkeypatch):
 
     await em.add_exchange("bybit", "k", "s")
     await em.add_exchange("binance", "k", "s")
-    em._last_health["bybit"] = time.time()
+    em._STATES["bybit"].last_health = time.time()
 
     for _ in range(em._FAIL_SWITCH):
         await em.check_exchange_health("bybit")
@@ -138,7 +135,7 @@ async def test_get_markets_retries(monkeypatch):
 
     client = DummyClient()
     client.load_markets = flaky_load
-    em._EXCHANGES["bybit"] = client
+    em._STATES["bybit"] = ExchangeState(client=client)
     monkeypatch.setattr(em, "_RETRY_DELAY", 0)
     monkeypatch.setattr(em, "_DEFAULT_RETRIES", 3)
 
@@ -199,7 +196,7 @@ async def test_health_listener_called(monkeypatch):
     monkeypatch.setattr(ccxt, "bybit", lambda config=None: DummyClient())
     await em.add_exchange("bybit", "k", "s")
 
-    em._last_health["bybit"] = time.time()
+    em._STATES["bybit"].last_health = time.time()
     await em.check_exchange_health("bybit")
 
     assert events and events[0] == ("bybit", True, "")
@@ -234,9 +231,9 @@ async def test_switch_selects_fastest_backup(monkeypatch):
 async def test_collect_metrics(monkeypatch):
     monkeypatch.setattr(ccxt, "bybit", lambda config=None: DummyClient())
     await em.add_exchange("bybit", "k", "s")
-    em._last_health["bybit"] = 1.0
-    em._FAIL_COUNTS["bybit"] = 2
-    em._PING_TIMES["bybit"] = 0.1
+    em._STATES["bybit"].last_health = 1.0
+    em._STATES["bybit"].fail_count = 2
+    em._STATES["bybit"].ping = 0.1
 
     metrics = em.collect_metrics()
     assert metrics["active_exchange"] == "bybit"
@@ -251,7 +248,7 @@ async def test_error_stats(monkeypatch):
 
     await em.add_exchange("bybit", "k", "s")
     await em.add_exchange("binance", "k", "s")
-    em._last_health["bybit"] = time.time()
+    em._STATES["bybit"].last_health = time.time()
     await em.check_exchange_health("bybit")
 
     metrics = em.collect_metrics()
@@ -287,6 +284,8 @@ async def test_reconnect_backoff(monkeypatch):
     monkeypatch.setattr(ccxt, "binance", lambda config=None: DummyClient())
 
     await em.add_exchange("binance", "k", "s")
+    await em.add_exchange("bybit", "k", "s")
+    em._STATES["bybit"].last_health = time.time()
     em._active_exchange = "binance"
     em._RECONNECT_DELAY = 1
     em._RECONNECT_MAX_DELAY = 4
@@ -305,7 +304,7 @@ async def test_reconnect_backoff(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_markets_invalid_payload(monkeypatch):
     client = DummyClient(markets=None)
-    em._EXCHANGES["bybit"] = client
+    em._STATES["bybit"] = ExchangeState(client=client)
 
     with pytest.raises(em.ExchangeError):
         await em.get_markets("bybit", ttl=0)
@@ -329,14 +328,14 @@ async def test_health_failures_reset_after_success(monkeypatch):
     monkeypatch.setattr(ccxt, "bybit", lambda config=None: Flaky())
 
     await em.add_exchange("bybit", "k", "s")
-    em._last_health["bybit"] = time.time()
+    em._STATES["bybit"].last_health = time.time()
 
     await em.check_exchange_health("bybit")  # failure 1
     await em.check_exchange_health("bybit")  # failure 2
-    assert em._FAIL_COUNTS["bybit"] == 2
+    assert em._STATES["bybit"].fail_count == 2
 
     await em.check_exchange_health("bybit")  # success
-    assert em._FAIL_COUNTS.get("bybit", 0) == 0
+    assert em._STATES["bybit"].fail_count == 0
 
 
 @pytest.mark.asyncio
@@ -368,7 +367,7 @@ async def test_parallel_health_checks_switch_once(monkeypatch):
     await em.add_exchange("bybit", "k", "s")
     await em.add_exchange("binance", "k", "s")
 
-    em._last_health["bybit"] = time.time()
+    em._STATES["bybit"].last_health = time.time()
     em._FAIL_SWITCH = 1
     em._REQUEST_LIMIT = 10
 
@@ -377,7 +376,7 @@ async def test_parallel_health_checks_switch_once(monkeypatch):
 
     # Failover only happens once and failure count resets
     assert em.get_active_exchange() == "binance"
-    assert em._FAIL_COUNTS.get("bybit", 0) == 0
+    assert em._STATES["bybit"].fail_count == 0
 
 
 @pytest.mark.asyncio
