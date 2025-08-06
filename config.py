@@ -299,6 +299,12 @@ def validate_config(config: Dict[str, Any]) -> bool:
                 raise ValueError("SWITCH_BACKUP_TIMEOUT must be positive")
             config["SWITCH_BACKUP_TIMEOUT"] = timeout
 
+        if "MANUAL_OUTAGE_THRESHOLD" in config:
+            mot = int(config["MANUAL_OUTAGE_THRESHOLD"])
+            if mot <= 0:
+                raise ValueError("MANUAL_OUTAGE_THRESHOLD must be positive")
+            config["MANUAL_OUTAGE_THRESHOLD"] = mot
+
         # Optional request and retry settings for exchange_manager
         if "REQUEST_RETRIES" in config:
             retries = int(config["REQUEST_RETRIES"])
@@ -633,7 +639,21 @@ def get_switch_backup_timeout() -> int:
 
 
 # ---------------------------------------------------------------------------
-# 13b. request/retry helpers
+# 13b. get_manual_outage_threshold
+# ---------------------------------------------------------------------------
+def get_manual_outage_threshold() -> int:
+    """Return seconds of downtime after which manual intervention is required."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("MANUAL_OUTAGE_THRESHOLD", 21600))
+    except ValueError:
+        val = 21600
+    return max(val, 0)
+
+
+# ---------------------------------------------------------------------------
+# 13c. request/retry helpers
 # ---------------------------------------------------------------------------
 def get_request_retries() -> int:
     """Return how many times API calls should be retried."""

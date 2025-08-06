@@ -5,7 +5,7 @@ import time
 import pytest
 
 import exchange_manager as em
-from exchange_manager import ccxt, ExchangeState
+from exchange_manager import ccxt, ExchangeState, ExchangeError
 
 
 class DummyClient:
@@ -35,6 +35,9 @@ def reset_state():
     em._MARKET_CACHE.clear()
     em._PAIR_CACHE.clear()
     em._PAIR_TTLS.clear()
+    em._MARKET_REFRESH.clear()
+    em._PAIR_REFRESH.clear()
+    em._MANUAL_OUTAGES.clear()
     em._HEALTH_LISTENERS.clear()
     em._ERROR_STATS.clear()
     em._RETRY_DELAY = 0
@@ -68,6 +71,30 @@ async def test_sync_trading_pairs(monkeypatch):
 
     mapping = await em.sync_trading_pairs(["bybit", "binance"])
     assert mapping == {"BTC/USDT": "BTCUSDT", "ETH/USDT": "ETHUSDT"}
+
+
+@pytest.mark.asyncio
+async def test_get_markets_returns_stale_during_refresh(monkeypatch):
+    """A second call returns cached data while a refresh is in flight."""
+
+    class SlowClient(DummyClient):
+        async def load_markets(self):
+            await asyncio.sleep(0.2)
+            return {"BTC/USDT": {}, "BTCUSDT": {}}
+
+    monkeypatch.setattr(ccxt, "bybit", lambda config=None: SlowClient())
+    await em.add_exchange("bybit", "k", "s")
+    em._MARKET_CACHE["bybit"] = (time.time(), {"BTC/USDT": {}, "BTCUSDT": {}})
+    em._STATES["bybit"].last_health = time.time()
+
+    task = asyncio.create_task(em.get_markets("bybit", ttl=0))
+    await asyncio.sleep(0.05)
+    start = time.perf_counter()
+    result = await em.get_markets("bybit", ttl=0)
+    elapsed = time.perf_counter() - start
+    await task
+    assert result == {"BTC/USDT": {}, "BTCUSDT": {}}
+    assert elapsed < 0.2
 
 
 @pytest.mark.asyncio
@@ -418,6 +445,26 @@ async def test_rate_limiter_enforces_limit(monkeypatch):
 
     await asyncio.gather(worker(), worker())
     assert timestamps[1] - timestamps[0] >= 0.05
+
+
+@pytest.mark.asyncio
+async def test_manual_outage_requires_intervention(monkeypatch):
+    """After long downtime the exchange is marked for manual recovery."""
+
+    em._MANUAL_OUTAGE_THRESHOLD = 1
+    em._STATES["bybit"] = ExchangeState(client=None, last_health=time.time() - 2)
+
+    noted = {}
+    async def fake_notify(subject, msg=""):
+        noted["s"] = subject
+    monkeypatch.setattr(em, "notify", fake_notify)
+
+    ok = await em.check_exchange_health("bybit")
+    assert not ok
+    assert "bybit" in em._MANUAL_OUTAGES
+    assert "manual" in noted.get("s", "").lower()
+    with pytest.raises(ExchangeError):
+        await em.get_markets("bybit")
 
 
 @pytest.mark.asyncio

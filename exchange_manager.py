@@ -30,6 +30,7 @@ from config import (
     get_request_retries,
     get_request_retry_delay,
     get_switch_backup_timeout,
+    get_manual_outage_threshold,
 )
 from logger import get_logger
 
@@ -149,10 +150,14 @@ _active_exchange: str | None = None
 _MARKET_CACHE: Dict[str, tuple[float, Dict]] = {}
 # Locks to ensure only one coroutine refreshes markets for a given exchange.
 _MARKET_LOCKS: Dict[str, asyncio.Lock] = {}
+# Background tasks refreshing market data to reduce lock contention.
+_MARKET_REFRESH: Dict[str, asyncio.Task] = {}
 # Small cache for pair synchronization: key (tuple of exchanges) -> (timestamp, mapping)
 _PAIR_CACHE: Dict[tuple[str, ...], tuple[float, Dict[str, str]]] = {}
 # Prevent concurrent pair refreshes to avoid blocking other tasks.
 _PAIR_LOCKS: Dict[tuple[str, ...], asyncio.Lock] = {}
+# Background tasks refreshing pair mappings.
+_PAIR_REFRESH: Dict[tuple[str, ...], asyncio.Task] = {}
 # Adaptive TTL so the cache refreshes faster when mappings change often and
 # slows down during quiet periods.  Values in seconds and configurable via
 # ``config.py`` using ``PAIR_TTL_MIN``, ``PAIR_TTL_MAX`` and ``PAIR_TTL_STEP``.
@@ -171,6 +176,9 @@ _MAX_FAILURES = int(CONFIG.get("HEALTH_FAILURE_THRESHOLD", 5))
 # Switch after a few consecutive failures even if total downtime is short
 _FAIL_SWITCH = int(CONFIG.get("HEALTH_SWITCH_FAILURES", 3))
 _SWITCH_TIMEOUT = get_switch_backup_timeout()
+# Escalate after very long outages to require manual intervention.
+_MANUAL_OUTAGE_THRESHOLD = get_manual_outage_threshold()
+_MANUAL_OUTAGES: set[str] = set()
 
 # Retry and rate-limit settings for graceful recovery under load.
 _DEFAULT_RETRIES = get_request_retries()
@@ -534,6 +542,7 @@ async def add_exchange(exchange_name: str, api_key: str, api_secret: str) -> Non
     """
 
     name = exchange_name.lower()
+    _MANUAL_OUTAGES.discard(name)
     if not api_key or not api_secret:
         key_field, secret_field = _KEY_MAP.get(name, ("", ""))
         api_key = api_key or CONFIG.get(key_field, "")
@@ -694,10 +703,20 @@ async def get_markets(exchange_name: str, ttl: int = 300) -> Dict:
     """
 
     name = exchange_name.lower()
+    if name in _MANUAL_OUTAGES:
+        raise ExchangeError("manual intervention required")
     now = time.time()
     cached = _MARKET_CACHE.get(name)
     if cached and now - cached[0] < ttl:
         return cached[1]
+    task = _MARKET_REFRESH.get(name)
+    if task and not task.done():
+        if cached:
+            return cached[1]
+        await task
+        cached = _MARKET_CACHE.get(name)
+        if cached:
+            return cached[1]
     lock = _MARKET_LOCKS.setdefault(name, asyncio.Lock())
     if lock.locked() and cached:
         return cached[1]
@@ -715,18 +734,26 @@ async def get_markets(exchange_name: str, ttl: int = 300) -> Dict:
             state = _STATES[name]
             client = state.client  # type: ignore[assignment]
 
-        async with _rate_limiter(name):
-            markets = await _call_with_retries(
-                client.load_markets, name, "load_markets", detail="sync pairs"
-            )
+        async def _refresh() -> None:
+            async with _rate_limiter(name):
+                markets = await _call_with_retries(
+                    client.load_markets, name, "load_markets", detail="sync pairs"
+                )
 
-        if not isinstance(markets, dict) or not markets:
-            logger.error("%s returned invalid markets payload: %r", name, markets)
-            await notify("Invalid market data", f"{name} returned {type(markets).__name__}")
-            raise ExchangeError("invalid markets payload")
+            if not isinstance(markets, dict) or not markets:
+                logger.error("%s returned invalid markets payload: %r", name, markets)
+                await notify("Invalid market data", f"{name} returned {type(markets).__name__}")
+                raise ExchangeError("invalid markets payload")
 
-        _MARKET_CACHE[name] = (now, markets)
-        return markets
+            _MARKET_CACHE[name] = (time.time(), markets)
+
+        task = asyncio.create_task(_refresh())
+        _MARKET_REFRESH[name] = task
+    try:
+        await task
+    finally:
+        _MARKET_REFRESH.pop(name, None)
+    return _MARKET_CACHE.get(name, (0, {}))[1]
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +800,15 @@ async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
     cached = _PAIR_CACHE.get(key)
     if cached and now - cached[0] < ttl:
         return cached[1]
+    task = _PAIR_REFRESH.get(key)
+    if task and not task.done():
+        if cached:
+            return cached[1]
+        await task
+        cached = _PAIR_CACHE.get(key)
+        ttl = _PAIR_TTLS.get(key, _PAIR_TTL_MIN)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
 
     lock = _PAIR_LOCKS.setdefault(key, asyncio.Lock())
     if lock.locked() and cached:
@@ -785,46 +821,52 @@ async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
         if cached and now - cached[0] < ttl:
             return cached[1]
 
-        # Load markets concurrently, reusing cached results where possible.
-        tasks = {name: asyncio.create_task(get_markets(name.lower())) for name in exchanges}
-        markets_by_exchange: Dict[str, Dict] = {}
-        try:
-            results = await asyncio.gather(*tasks.values())
-            for exch_name, markets in zip(tasks.keys(), results):
-                markets_by_exchange[exch_name.lower()] = markets
-        except NetworkError as exc:
-            logger.error("Network error during market sync: %s", exc)
-            await notify("Market sync network error", str(exc))
-            return {}
-        except ExchangeError as exc:
-            logger.error("API error during market sync: %s", exc)
-            await notify("Market sync API error", str(exc))
-            return {}
-        except Exception as exc:
-            logger.error("Market load failed: %s", exc)
-            await notify("Market sync failed", str(exc))
-            return {}
+        async def _refresh() -> None:
+            # Load markets concurrently, reusing cached results where possible.
+            tasks = {name: asyncio.create_task(get_markets(name.lower())) for name in exchanges}
+            markets_by_exchange: Dict[str, Dict] = {}
+            try:
+                results = await asyncio.gather(*tasks.values())
+                for exch_name, markets in zip(tasks.keys(), results):
+                    markets_by_exchange[exch_name.lower()] = markets
+            except NetworkError as exc:
+                logger.error("Network error during market sync: %s", exc)
+                await notify("Market sync network error", str(exc))
+                return
+            except ExchangeError as exc:
+                logger.error("API error during market sync: %s", exc)
+                await notify("Market sync API error", str(exc))
+                return
+            except Exception as exc:
+                logger.error("Market load failed: %s", exc)
+                await notify("Market sync failed", str(exc))
+                return
 
-        valid_mapping: Dict[str, str] = {}
-        for spot_pair, fut_pair in mapping.items():
-            missing = []
-            for name in exchanges:
-                markets = markets_by_exchange.get(name.lower(), {})
-                if spot_pair not in markets or fut_pair not in markets:
-                    missing.append(name)
-            if missing:
-                logger.warning("Pair %s/%s missing on %s", spot_pair, fut_pair, ", ".join(missing))
+            valid_mapping: Dict[str, str] = {}
+            for spot_pair, fut_pair in mapping.items():
+                missing = []
+                for name in exchanges:
+                    markets = markets_by_exchange.get(name.lower(), {})
+                    if spot_pair not in markets or fut_pair not in markets:
+                        missing.append(name)
+                if missing:
+                    logger.warning("Pair %s/%s missing on %s", spot_pair, fut_pair, ", ".join(missing))
+                else:
+                    valid_mapping[spot_pair] = fut_pair
+            previous = cached[1] if cached else None
+            _PAIR_CACHE[key] = (time.time(), valid_mapping)
+            if previous == valid_mapping:
+                _PAIR_TTLS[key] = min(_PAIR_TTLS.get(key, _PAIR_TTL_MIN) + _PAIR_TTL_STEP, _PAIR_TTL_MAX)
             else:
-                valid_mapping[spot_pair] = fut_pair
-        previous = cached[1] if cached else None
-        _PAIR_CACHE[key] = (now, valid_mapping)
-        if previous and previous != valid_mapping:
-            ttl = _PAIR_TTL_MIN
-        else:
-            ttl = min(ttl + _PAIR_TTL_STEP, _PAIR_TTL_MAX)
-        _PAIR_TTLS[key] = ttl
-        logger.info("Pair sync result: %s (ttl=%d s)", valid_mapping, ttl)
-        return valid_mapping
+                _PAIR_TTLS[key] = _PAIR_TTL_MIN
+
+        task = asyncio.create_task(_refresh())
+        _PAIR_REFRESH[key] = task
+    try:
+        await task
+    finally:
+        _PAIR_REFRESH.pop(key, None)
+    return _PAIR_CACHE.get(key, (0, {}))[1]
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +898,11 @@ async def check_exchange_health(exchange_name: str) -> bool:
                 minutes = int(downtime // 60)
                 logger.critical("Exchange %s still offline (%d min)", name, minutes)
                 await notify("Exchange outage", f"{name} down {minutes}m")
+        if downtime > _MANUAL_OUTAGE_THRESHOLD and name not in _MANUAL_OUTAGES:
+            _MANUAL_OUTAGES.add(name)
+            hours = int(downtime // 3600)
+            logger.critical("Exchange %s down %dh - manual intervention required", name, hours)
+            await notify("Manual intervention required", f"{name} offline {hours}h")
         logger.error("Exchange %s not registered", name)
         return False
     err = None
@@ -923,6 +970,11 @@ async def check_exchange_health(exchange_name: str) -> bool:
                 state.fail_count = 0
             await switch_to_backup_exchange()
     downtime = now - last
+    if downtime > _MANUAL_OUTAGE_THRESHOLD and name not in _MANUAL_OUTAGES:
+        _MANUAL_OUTAGES.add(name)
+        hours = int(downtime // 3600)
+        logger.critical("Exchange %s down %dh - manual intervention required", name, hours)
+        await notify("Manual intervention required", f"{name} offline {hours}h")
     if downtime > _OUTAGE_THRESHOLD:
         minutes = int(downtime // 60)
         last_alert = _LAST_OUTAGE_ALERT.get(name, 0)

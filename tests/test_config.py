@@ -211,6 +211,11 @@ def test_switch_backup_timeout_helper(monkeypatch):
     assert config.get_switch_backup_timeout() == 400
 
 
+def test_manual_outage_threshold_helper(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {'MANUAL_OUTAGE_THRESHOLD': '7200'})
+    assert config.get_manual_outage_threshold() == 7200
+
+
 def test_validate_switch_timeout():
     good = {
         'SPOT_PAIRS': "['BTC/USDT']",
@@ -222,6 +227,20 @@ def test_validate_switch_timeout():
     assert config.validate_config(good)
     bad = good.copy()
     bad['SWITCH_BACKUP_TIMEOUT'] = '0'
+    assert not config.validate_config(bad)
+
+
+def test_validate_manual_outage_threshold(monkeypatch):
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'MANUAL_OUTAGE_THRESHOLD': '10'
+    }
+    assert config.validate_config(good)
+    bad = good.copy()
+    bad['MANUAL_OUTAGE_THRESHOLD'] = '0'
     assert not config.validate_config(bad)
 
 
