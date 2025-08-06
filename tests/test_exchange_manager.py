@@ -317,3 +317,47 @@ async def test_rate_limiter_enforces_limit(monkeypatch):
 
     await asyncio.gather(worker(), worker())
     assert timestamps[1] - timestamps[0] >= 0.05
+
+
+@pytest.mark.asyncio
+async def test_parallel_health_checks_switch_once(monkeypatch):
+    """Concurrent health probes still trigger a single failover."""
+
+    # bybit fails, binance healthy
+    monkeypatch.setattr(ccxt, "bybit", lambda config=None: DummyClient(fail_fetch=True))
+    monkeypatch.setattr(ccxt, "binance", lambda config=None: DummyClient())
+
+    await em.add_exchange("bybit", "k", "s")
+    await em.add_exchange("binance", "k", "s")
+
+    em._last_health["bybit"] = time.time()
+    em._FAIL_SWITCH = 1
+    em._REQUEST_LIMIT = 10
+
+    # Launch several health checks simultaneously
+    await asyncio.gather(*(em.check_exchange_health("bybit") for _ in range(3)))
+
+    # Failover only happens once and failure count resets
+    assert em.get_active_exchange() == "binance"
+    assert em._FAIL_COUNTS.get("bybit", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_isolation_across_exchanges():
+    """Each exchange maintains its own semaphore allowing parallelism."""
+
+    em._REQUEST_LIMIT = 1
+    sem_a = em._rate_limiter("bybit")
+    sem_b = em._rate_limiter("binance")
+
+    times: list[float] = []
+
+    async def worker(sem: asyncio.Semaphore):
+        async with sem:
+            times.append(time.perf_counter())
+            await asyncio.sleep(0.05)
+
+    await asyncio.gather(worker(sem_a), worker(sem_b))
+
+    # Because semaphores are per exchange, start times should be near-identical
+    assert abs(times[1] - times[0]) < 0.05
