@@ -30,6 +30,37 @@ from config import (
 )
 from logger import get_logger
 
+# Optional Prometheus metrics support.  The module is entirely optional so the
+# manager can run in very lightweight environments.  When installed a tiny HTTP
+# server can be started to expose runtime metrics for systems such as Grafana or
+# Prometheus.
+try:  # pragma: no cover - metrics optional in tests
+    from prometheus_client import Gauge, start_http_server
+
+    _PROM_HEALTH = Gauge(
+        "exchange_last_health_seconds",
+        "Unix timestamp of the last successful health check",
+        ["exchange"],
+    )
+    _PROM_LATENCY = Gauge(
+        "exchange_latency_seconds",
+        "Latency of the last health check",
+        ["exchange"],
+    )
+
+    def start_metrics_server(port: int = 8000) -> None:
+        """Start an HTTP server exposing Prometheus metrics."""
+
+        start_http_server(port)
+
+except Exception:  # pragma: no cover - library missing
+    _PROM_HEALTH = _PROM_LATENCY = None
+
+    def start_metrics_server(port: int = 8000) -> None:
+        """Fallback when :mod:`prometheus_client` is not available."""
+
+        logger.info("Prometheus client not installed; metrics disabled")
+
 try:  # pragma: no cover - notifier provided in real project
     from notification_manager import notify  # type: ignore
 except Exception:  # pragma: no cover - fallback for early development
@@ -85,6 +116,21 @@ _KEY_MAP = {
     "bybit": ("API_KEY", "API_SECRET"),
     "binance": ("BACKUP_API_KEY", "BACKUP_API_SECRET"),
 }
+
+# Track measured latency of the last successful health check per exchange.  These
+# values are also exposed via Prometheus gauges when available.
+_PING_TIMES: Dict[str, float] = {}
+
+# Primary exchange to which the bot prefers to connect.  Backup exchanges will be
+# used only when the primary is considered unhealthy.
+_PRIMARY = str(CONFIG.get("PRIMARY_EXCHANGE", "bybit")).lower()
+
+# Parameters governing how often we attempt to reconnect to the primary exchange
+# once a failover occurred.  ``_RECONNECT_DELAY`` starts small and is doubled
+# after each failed attempt until ``_RECONNECT_MAX_DELAY``.
+_RECONNECT_DELAY = int(CONFIG.get("RECONNECT_DELAY", 300))
+_RECONNECT_MAX_DELAY = int(CONFIG.get("RECONNECT_MAX_DELAY", 3600))
+_NEXT_RECONNECT: float = 0.0
 
 
 def _get_backup_candidates() -> List[str]:
@@ -238,6 +284,35 @@ async def _get_client_for_exchange(name: str) -> ccxt.Exchange:
     return client
 
 
+async def _probe_exchange(name: str) -> float | None:
+    """Measure ``fetch_time`` latency for ``name``.
+
+    A ``None`` result indicates that the exchange is unreachable.  Latencies are
+    recorded in ``_PING_TIMES`` and, if Prometheus metrics are enabled, updated
+    in the corresponding gauges.
+    """
+
+    try:
+        client = await _get_client_for_exchange(name)
+    except Exception as exc:  # pragma: no cover - construction failure
+        logger.error("Failed to get client for %s: %s", name, exc)
+        return None
+
+    start = time.perf_counter()
+    try:
+        async with _rate_limiter(name):
+            await _call_with_retries(client.fetch_time, name, "fetch_time")
+    except Exception as exc:
+        logger.error("Latency probe failed for %s: %s", name, exc)
+        return None
+
+    latency = time.perf_counter() - start
+    _PING_TIMES[name] = latency
+    if _PROM_LATENCY:
+        _PROM_LATENCY.labels(name).set(latency)
+    return latency
+
+
 # ---------------------------------------------------------------------------
 # 1. add_exchange
 # ---------------------------------------------------------------------------
@@ -293,26 +368,71 @@ async def add_exchange(exchange_name: str, api_key: str, api_secret: str) -> Non
 # 2. switch_to_backup_exchange
 # ---------------------------------------------------------------------------
 async def switch_to_backup_exchange() -> bool:
-    """Switch active exchange to the first available backup.
+    """Switch active exchange to the healthiest available backup.
 
-    Multiple candidates can be supplied via ``BACKUP_EXCHANGES`` in the
-    configuration.  The first exchange that can be initialised becomes active.
-    Returns ``True`` on success.
+    All candidates are probed concurrently and the one with the lowest latency
+    is selected.  If none respond the active exchange remains unchanged.
     """
 
-    global _active_exchange
-    for backup in _get_backup_candidates():
-        if _active_exchange == backup:
-            return True
-        try:
-            await _get_client_for_exchange(backup)
-            old = _active_exchange
-            _active_exchange = backup
-            logger.warning("Switching from %s to backup %s", old, backup)
-            return True
-        except Exception as exc:
-            logger.error("Failed to switch to backup %s: %s", backup, exc)
-            await notify("Backup switch failed", f"{backup}: {exc}")
+    global _active_exchange, _NEXT_RECONNECT
+    candidates = [c for c in _get_backup_candidates() if c != _active_exchange]
+    if not candidates:
+        return False
+
+    probes = {name: asyncio.create_task(_probe_exchange(name)) for name in candidates}
+    results = await asyncio.gather(*probes.values())
+    latencies = {name: lat for name, lat in zip(probes.keys(), results) if lat is not None}
+    if not latencies:
+        return False
+
+    best = min(latencies, key=latencies.get)
+    old = _active_exchange
+    _active_exchange = best
+    _NEXT_RECONNECT = time.time() + _RECONNECT_DELAY
+    logger.warning(
+        "Switching from %s to backup %s (latency %.3fs)",
+        old,
+        best,
+        latencies[best],
+    )
+    return True
+
+
+async def _maybe_reconnect_primary() -> bool:
+    """Attempt to reconnect to the primary exchange if the backoff period passed.
+
+    Returns ``True`` if the primary became active.  The delay between attempts
+    grows exponentially up to ``_RECONNECT_MAX_DELAY``.
+    """
+
+    global _active_exchange, _RECONNECT_DELAY, _NEXT_RECONNECT
+    if _active_exchange == _PRIMARY:
+        return True
+
+    now = time.time()
+    if now < _NEXT_RECONNECT:
+        return False
+
+    latency = await _probe_exchange(_PRIMARY)
+    if latency is not None:
+        old = _active_exchange
+        _active_exchange = _PRIMARY
+        _RECONNECT_DELAY = int(CONFIG.get("RECONNECT_DELAY", 300))
+        logger.warning(
+            "Reconnected to primary %s from %s (latency %.3fs)",
+            _PRIMARY,
+            old,
+            latency,
+        )
+        return True
+
+    _RECONNECT_DELAY = min(_RECONNECT_DELAY * 2, _RECONNECT_MAX_DELAY)
+    _NEXT_RECONNECT = now + _RECONNECT_DELAY
+    logger.error(
+        "Primary %s still unreachable; next retry in %ds",
+        _PRIMARY,
+        _RECONNECT_DELAY,
+    )
     return False
 
 
@@ -498,10 +618,15 @@ async def check_exchange_health(exchange_name: str) -> bool:
         return False
     err = None
     try:
+        start = time.perf_counter()
         async with _rate_limiter(name):
             await asyncio.wait_for(
                 _call_with_retries(client.fetch_time, name, "fetch_time"), timeout=10
             )
+        latency = time.perf_counter() - start
+        _PING_TIMES[name] = latency
+        if _PROM_LATENCY:
+            _PROM_LATENCY.labels(name).set(latency)
     except RateLimitExceeded as exc:
         err_kind = "rate limit"
         err = exc
@@ -519,8 +644,12 @@ async def check_exchange_health(exchange_name: str) -> bool:
         _FAIL_COUNTS[name] = 0
         if name in _OUTAGE_REPORTED:
             _OUTAGE_REPORTED.discard(name)
+        if _PROM_HEALTH:
+            _PROM_HEALTH.labels(name).set(now)
         logger.debug("Exchange %s healthy", name)
         await _fire_health_event(name, True)
+        if name == _active_exchange and _active_exchange != _PRIMARY:
+            await _maybe_reconnect_primary()
         return True
 
     failures = _FAIL_COUNTS.get(name, 0) + 1
@@ -553,6 +682,8 @@ async def check_exchange_health(exchange_name: str) -> bool:
         logger.error("Removing %s after %d min offline", name, minutes)
         await remove_exchange(name, downtime)
     await _fire_health_event(name, False, err_kind)
+    if name == _active_exchange and _active_exchange != _PRIMARY:
+        await _maybe_reconnect_primary()
     return False
 
 
@@ -601,3 +732,19 @@ async def close_all_exchanges() -> None:
         except Exception:
             pass
     _EXCHANGES.clear()
+
+
+def collect_metrics() -> Dict[str, Dict[str, float | int | str]]:
+    """Return internal counters for external monitoring systems.
+
+    The returned dictionary can be easily exported to JSON or plugged into a
+    metrics collector.  It contains the currently active exchange, last health
+    timestamps, failure counts, and measured latencies.
+    """
+
+    return {
+        "active_exchange": _active_exchange or "",
+        "last_health": dict(_last_health),
+        "fail_counts": dict(_FAIL_COUNTS),
+        "latency": dict(_PING_TIMES),
+    }

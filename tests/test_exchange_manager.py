@@ -201,6 +201,66 @@ async def test_health_listener_called(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_switch_selects_fastest_backup(monkeypatch):
+    """When multiple backups respond the lowest-latency one is chosen."""
+
+    class Slow(DummyClient):
+        async def fetch_time(self):  # type: ignore[override]
+            await asyncio.sleep(0.05)
+            return int(time.time() * 1000)
+
+    class Fast(DummyClient):
+        async def fetch_time(self):  # type: ignore[override]
+            return int(time.time() * 1000)
+
+    monkeypatch.setattr(ccxt, "slow", lambda config=None: Slow(), raising=False)
+    monkeypatch.setattr(ccxt, "fast", lambda config=None: Fast(), raising=False)
+    monkeypatch.setattr(ccxt, "bybit", lambda config=None: DummyClient())
+
+    await em.add_exchange("bybit", "k", "s")
+    em.CONFIG["BACKUP_EXCHANGES"] = '["slow","fast"]'
+
+    ok = await em.switch_to_backup_exchange()
+    assert ok
+    assert em.get_active_exchange() == "fast"
+
+
+@pytest.mark.asyncio
+async def test_collect_metrics(monkeypatch):
+    monkeypatch.setattr(ccxt, "bybit", lambda config=None: DummyClient())
+    await em.add_exchange("bybit", "k", "s")
+    em._last_health["bybit"] = 1.0
+    em._FAIL_COUNTS["bybit"] = 2
+    em._PING_TIMES["bybit"] = 0.1
+
+    metrics = em.collect_metrics()
+    assert metrics["active_exchange"] == "bybit"
+    assert metrics["fail_counts"]["bybit"] == 2
+    assert metrics["latency"]["bybit"] == 0.1
+
+
+@pytest.mark.asyncio
+async def test_reconnect_backoff(monkeypatch):
+    monkeypatch.setattr(ccxt, "bybit", lambda config=None: DummyClient(fail_fetch=True))
+    monkeypatch.setattr(ccxt, "binance", lambda config=None: DummyClient())
+
+    await em.add_exchange("binance", "k", "s")
+    em._active_exchange = "binance"
+    em._RECONNECT_DELAY = 1
+    em._RECONNECT_MAX_DELAY = 4
+    em._NEXT_RECONNECT = 0
+
+    ok = await em._maybe_reconnect_primary()
+    assert not ok
+    first_delay = em._RECONNECT_DELAY
+    assert first_delay == 2
+    # simulate another immediate attempt to ensure delay grows again
+    em._NEXT_RECONNECT = 0
+    await em._maybe_reconnect_primary()
+    assert em._RECONNECT_DELAY == 4
+
+
+@pytest.mark.asyncio
 async def test_get_markets_invalid_payload(monkeypatch):
     client = DummyClient(markets=None)
     em._EXCHANGES["bybit"] = client
