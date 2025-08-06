@@ -117,10 +117,10 @@ async def _ensure_schema(conn: aiosqlite.Connection) -> None:
             timestamp TEXT NOT NULL,
             spot_symbol TEXT NOT NULL,
             futures_symbol TEXT NOT NULL,
-            spot_bid REAL NOT NULL,
-            futures_ask REAL NOT NULL,
-            trade_qty REAL DEFAULT 0,
-            funding_rate REAL DEFAULT 0
+            spot_bid NUMERIC NOT NULL,
+            futures_ask NUMERIC NOT NULL,
+            trade_qty NUMERIC DEFAULT 0,
+            funding_rate NUMERIC DEFAULT 0
         )
         """
     )
@@ -128,12 +128,16 @@ async def _ensure_schema(conn: aiosqlite.Connection) -> None:
     # from an older schema.  We introspect and patch missing fields so queries
     # referencing ``trade_qty`` or ``funding_rate`` don't crash with
     # ``OperationalError: no such column``.
-    info = await conn.execute_fetchall("PRAGMA table_info(trades)")
+    cur = await conn.execute("PRAGMA table_info(trades)")
+    info = await cur.fetchall()
     cols = {row[1] for row in info}
     if "trade_qty" not in cols:
-        await conn.execute("ALTER TABLE trades ADD COLUMN trade_qty REAL DEFAULT 0")
+        await conn.execute("ALTER TABLE trades ADD COLUMN trade_qty NUMERIC DEFAULT 0")
     if "funding_rate" not in cols:
-        await conn.execute("ALTER TABLE trades ADD COLUMN funding_rate REAL DEFAULT 0")
+        await conn.execute("ALTER TABLE trades ADD COLUMN funding_rate NUMERIC DEFAULT 0")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pair_time ON trades(spot_symbol, futures_symbol, timestamp)"
+    )
     await conn.commit()
 
 
@@ -179,6 +183,16 @@ def _cleanup_old_backups(limit: int = 20, max_age_days: int = 30, max_total_mb: 
         removed,
         total_size / 1_048_576,
     )
+
+
+async def checkpoint_wal() -> None:
+    """Truncate the Write-Ahead Log to keep it from growing forever."""
+    conn = await _get_conn()
+    try:
+        await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception as exc:  # pragma: no cover - rare failure
+        logger.error("WAL checkpoint failed: %s", exc)
+        await notify("Database WAL checkpoint failed", str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +453,7 @@ async def backup_database(compress: bool = True) -> None:
         await asyncio.to_thread(_copy, _DB_PATH, backup_file, compress)
         logger.info("Database backup created at %s", backup_file)
         await asyncio.to_thread(_cleanup_old_backups)
+        await checkpoint_wal()
     except Exception as exc:
         logger.error("Database backup failed: %s", exc)
         await notify("Database backup failed", str(exc))

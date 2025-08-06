@@ -79,6 +79,9 @@ async def test_backup_and_cleanup(temp_db):
     await database.backup_database(compress=False)
     backups = list(backup_dir.glob("*.bak"))
     assert backups
+    wal = db_path.with_suffix(".db-wal")
+    if wal.exists():
+        assert wal.stat().st_size == 0
 
 
 @pytest.mark.asyncio
