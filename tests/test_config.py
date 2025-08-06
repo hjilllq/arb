@@ -204,3 +204,22 @@ def test_validate_retry_delays():
     bad = good.copy()
     bad['API_RETRY_BASE_DELAY'] = '-1'
     assert not config.validate_config(bad)
+
+
+def test_switch_backup_timeout_helper(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {'SWITCH_BACKUP_TIMEOUT': '400'})
+    assert config.get_switch_backup_timeout() == 400
+
+
+def test_validate_switch_timeout():
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'SWITCH_BACKUP_TIMEOUT': '300'
+    }
+    assert config.validate_config(good)
+    bad = good.copy()
+    bad['SWITCH_BACKUP_TIMEOUT'] = '0'
+    assert not config.validate_config(bad)

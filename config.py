@@ -292,6 +292,12 @@ def validate_config(config: Dict[str, Any]) -> bool:
                 raise ValueError("API retry delays must be positive and base <= max")
             config["API_RETRY_BASE_DELAY"] = base
             config["API_RETRY_MAX_DELAY"] = mx
+
+        if "SWITCH_BACKUP_TIMEOUT" in config:
+            timeout = int(config["SWITCH_BACKUP_TIMEOUT"])
+            if timeout <= 0:
+                raise ValueError("SWITCH_BACKUP_TIMEOUT must be positive")
+            config["SWITCH_BACKUP_TIMEOUT"] = timeout
     except Exception as exc:  # broad to keep example child friendly
         logger.error("Validation failed: %s", exc)
         try:
@@ -593,6 +599,20 @@ def get_retry_max_delay() -> float:
     except ValueError:
         mx = 60.0
     return max(mx, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 13a. get_switch_backup_timeout
+# ---------------------------------------------------------------------------
+def get_switch_backup_timeout() -> int:
+    """Return seconds to wait before switching to the backup exchange."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("SWITCH_BACKUP_TIMEOUT", 300))
+    except ValueError:
+        val = 300
+    return max(val, 0)
 
 
 # ---------------------------------------------------------------------------

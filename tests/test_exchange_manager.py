@@ -75,3 +75,18 @@ async def test_check_exchange_health_switches(monkeypatch):
     ok = await em.check_exchange_health("bybit")
     assert not ok
     assert em.get_active_exchange() == "binance"
+
+
+@pytest.mark.asyncio
+async def test_failure_count_triggers_switch(monkeypatch):
+    monkeypatch.setattr(ccxt, "bybit", lambda config=None: DummyClient(fail_fetch=True))
+    monkeypatch.setattr(ccxt, "binance", lambda config=None: DummyClient())
+
+    await em.add_exchange("bybit", "k", "s")
+    await em.add_exchange("binance", "k", "s")
+    em._last_health["bybit"] = time.time()
+
+    for _ in range(em._FAIL_SWITCH):
+        await em.check_exchange_health("bybit")
+
+    assert em.get_active_exchange() == "binance"

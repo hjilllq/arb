@@ -19,7 +19,7 @@ RateLimitExceeded = getattr(ccxt, "RateLimitExceeded", Exception)
 NetworkError = getattr(ccxt, "NetworkError", Exception)
 ExchangeError = getattr(ccxt, "ExchangeError", Exception)
 
-from config import CONFIG, get_pair_mapping
+from config import CONFIG, get_pair_mapping, get_switch_backup_timeout
 from logger import get_logger
 
 try:  # pragma: no cover - notifier provided in real project
@@ -56,12 +56,25 @@ _LAST_OUTAGE_ALERT: Dict[str, float] = {}
 # Count consecutive health check failures per exchange
 _FAIL_COUNTS: Dict[str, int] = {}
 _MAX_FAILURES = 5  # consecutive failures before extra notification
+# Switch after a few consecutive failures even if total downtime is short
+_FAIL_SWITCH = 3
+_SWITCH_TIMEOUT = get_switch_backup_timeout()
 
 # Helper mapping from logical names to config keys for API credentials.
 _KEY_MAP = {
     "bybit": ("API_KEY", "API_SECRET"),
     "binance": ("BACKUP_API_KEY", "BACKUP_API_SECRET"),
 }
+
+
+async def _get_client_for_exchange(name: str) -> ccxt.Exchange:
+    """Return a ccxt client for ``name`` creating it on demand."""
+    client = _EXCHANGES.get(name)
+    if client is None:
+        key_field, secret_field = _KEY_MAP.get(name, ("", ""))
+        await add_exchange(name, CONFIG.get(key_field, ""), CONFIG.get(secret_field, ""))
+        client = _EXCHANGES[name]
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -129,9 +142,7 @@ async def switch_to_backup_exchange() -> bool:
     if _active_exchange == backup:
         return True
     try:
-        if backup not in _EXCHANGES:
-            key_field, secret_field = _KEY_MAP.get(backup, ("", ""))
-            await add_exchange(backup, CONFIG.get(key_field, ""), CONFIG.get(secret_field, ""))
+        await _get_client_for_exchange(backup)
         old = _active_exchange
         _active_exchange = backup
         logger.warning("Switching from %s to backup %s", old, backup)
@@ -351,17 +362,21 @@ async def check_exchange_health(exchange_name: str) -> bool:
         logger.debug("Exchange %s healthy", name)
         return True
 
-    logger.warning("Health check %s error for %s: %s", err_kind, name, err)
-    await notify("Exchange health failed", f"{name} ({err_kind}): {err}")
     failures = _FAIL_COUNTS.get(name, 0) + 1
     _FAIL_COUNTS[name] = failures
+    last = _last_health.get(name, 0)
+    logger.warning(
+        "Health check %s error for %s (failure %d): %s", err_kind, name, failures, err
+    )
+    await notify("Exchange health failed", f"{name} ({err_kind}): {err}")
     if failures >= _MAX_FAILURES:
         logger.error("%s failed %d health checks", name, failures)
         await notify("Repeated health failures", f"{name} x{failures}")
         _FAIL_COUNTS[name] = 0
-    last = _last_health.get(name, 0)
-    if name == "bybit" and now - last > 300:
-        await switch_to_backup_exchange()
+    if name == "bybit" and _active_exchange == "bybit":
+        if now - last > _SWITCH_TIMEOUT or failures >= _FAIL_SWITCH:
+            _FAIL_COUNTS[name] = 0
+            await switch_to_backup_exchange()
     downtime = now - last
     if downtime > _OUTAGE_THRESHOLD:
         minutes = int(downtime // 60)
