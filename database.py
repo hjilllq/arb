@@ -4,6 +4,10 @@ This module is like an album where we glue tiny stickers for every price and
 trade.  Each function speaks in simple sentences so even a curious kid can read
 it.  Operations are asynchronous to keep our Apple Silicon M4 Max cool and
 energy‑frugal.
+
+Note that the maximum number of concurrent queries is determined when the
+module is imported.  Changing ``DB_QUERY_CONCURRENCY`` in ``.env`` during
+runtime requires a restart or module reload to take effect.
 """
 from __future__ import annotations
 
@@ -62,7 +66,9 @@ _DB_CONN: Optional[aiosqlite.Connection] = None
 
 # Limit concurrent query connections so SQLite isn't overwhelmed.  The default
 # value of ``5`` can be overridden via the ``DB_QUERY_CONCURRENCY`` setting in
-# ``.env`` so operators can tune performance without touching the code.
+# ``.env`` so operators can tune performance without touching the code.  The
+# semaphore is created at import time; adjusting the value at runtime requires a
+# process restart or module reload.
 _CONFIG = load_config()
 _QUERY_SEMAPHORE = asyncio.Semaphore(
     int(_CONFIG.get("DB_QUERY_CONCURRENCY", 5))
@@ -118,6 +124,16 @@ async def _ensure_schema(conn: aiosqlite.Connection) -> None:
         )
         """
     )
+    # ``IF NOT EXISTS`` won't add missing columns if the table already exists
+    # from an older schema.  We introspect and patch missing fields so queries
+    # referencing ``trade_qty`` or ``funding_rate`` don't crash with
+    # ``OperationalError: no such column``.
+    info = await conn.execute_fetchall("PRAGMA table_info(trades)")
+    cols = {row[1] for row in info}
+    if "trade_qty" not in cols:
+        await conn.execute("ALTER TABLE trades ADD COLUMN trade_qty REAL DEFAULT 0")
+    if "funding_rate" not in cols:
+        await conn.execute("ALTER TABLE trades ADD COLUMN funding_rate REAL DEFAULT 0")
     await conn.commit()
 
 
