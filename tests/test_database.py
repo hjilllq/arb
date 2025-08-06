@@ -61,6 +61,12 @@ async def test_save_and_query(temp_db):
     assert data[0]["trade_qty"] == 1.5
     assert data[0]["funding_rate"] == 0.001
 
+    # DataFrame branch
+    df = await database.query_data(
+        "BTC/USDT", "BTCUSDT", rows[0]["timestamp"], rows[1]["timestamp"], as_dataframe=True
+    )
+    assert list(df["spot_bid"]) == [59990, 60010]
+
 
 @pytest.mark.asyncio
 async def test_backup_and_cleanup(temp_db):
@@ -82,6 +88,51 @@ async def test_backup_and_cleanup(temp_db):
     wal = db_path.with_suffix(".db-wal")
     if wal.exists():
         assert wal.stat().st_size == 0
+
+
+@pytest.mark.asyncio
+async def test_upsert_unique(temp_db):
+    first = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "spot_symbol": "BTC/USDT",
+        "futures_symbol": "BTCUSDT",
+        "spot_bid": 1,
+        "futures_ask": 2,
+    }
+    await database.save_data([first])
+    second = dict(first)
+    second["spot_bid"] = 3
+    await database.save_data([second])
+    data = await database.query_data(
+        "BTC/USDT", "BTCUSDT", first["timestamp"], first["timestamp"]
+    )
+    assert len(data) == 1 and data[0]["spot_bid"] == 3
+
+
+@pytest.mark.asyncio
+async def test_save_atomic(temp_db, monkeypatch):
+    rows = [
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "spot_symbol": "BTC/USDT",
+            "futures_symbol": "BTCUSDT",
+            "spot_bid": 1,
+            "futures_ask": 2,
+        },
+        {
+            "timestamp": (datetime.utcnow() + timedelta(seconds=1)).isoformat(),
+            "spot_symbol": "BTC/USDT",
+            "futures_symbol": "BTCUSDT",
+            "spot_bid": 3,
+            "futures_ask": 4,
+        },
+    ]
+    conn = await database._get_conn()
+    async def boom():
+        raise RuntimeError("boom")
+    monkeypatch.setattr(conn, "commit", boom)
+    await database.save_data(rows)
+    assert await database.count_rows() == 0
 
 
 @pytest.mark.asyncio
@@ -110,6 +161,20 @@ async def test_clear_old_data(temp_db):
     await database.clear_old_data(days=90)
     data = await database.query_data("BTC/USDT", "BTCUSDT", old_ts, new_ts)
     assert len(data) == 1 and data[0]["timestamp"] == new_ts
+
+
+@pytest.mark.asyncio
+async def test_vacuum_db(temp_db):
+    await database.save_data(
+        [{
+            "timestamp": datetime.utcnow().isoformat(),
+            "spot_symbol": "ETH/USDT",
+            "futures_symbol": "ETHUSDT",
+            "spot_bid": 1,
+            "futures_ask": 2,
+        }]
+    )
+    await database.vacuum_db()  # Should run without error
 
 
 def test_validate_data_rejects_negative():

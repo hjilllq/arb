@@ -19,7 +19,7 @@ import random
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 
 import aiosqlite
 import pandas as pd
@@ -117,11 +117,12 @@ async def _ensure_schema(conn: aiosqlite.Connection) -> None:
             timestamp TEXT NOT NULL,
             spot_symbol TEXT NOT NULL,
             futures_symbol TEXT NOT NULL,
-            spot_bid NUMERIC NOT NULL,
-            futures_ask NUMERIC NOT NULL,
-            trade_qty NUMERIC DEFAULT 0,
-            funding_rate NUMERIC DEFAULT 0
-        )
+            spot_bid REAL NOT NULL,
+            futures_ask REAL NOT NULL,
+            trade_qty REAL DEFAULT 0,
+            funding_rate REAL DEFAULT 0,
+            UNIQUE(timestamp, spot_symbol, futures_symbol)
+        ) STRICT
         """
     )
     # ``IF NOT EXISTS`` won't add missing columns if the table already exists
@@ -132,11 +133,14 @@ async def _ensure_schema(conn: aiosqlite.Connection) -> None:
     info = await cur.fetchall()
     cols = {row[1] for row in info}
     if "trade_qty" not in cols:
-        await conn.execute("ALTER TABLE trades ADD COLUMN trade_qty NUMERIC DEFAULT 0")
+        await conn.execute("ALTER TABLE trades ADD COLUMN trade_qty REAL DEFAULT 0")
     if "funding_rate" not in cols:
-        await conn.execute("ALTER TABLE trades ADD COLUMN funding_rate NUMERIC DEFAULT 0")
+        await conn.execute("ALTER TABLE trades ADD COLUMN funding_rate REAL DEFAULT 0")
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pair_time ON trades(spot_symbol, futures_symbol, timestamp)"
+    )
+    await conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_pair_time ON trades(timestamp, spot_symbol, futures_symbol)"
     )
     await conn.commit()
 
@@ -234,10 +238,9 @@ async def save_data(data: List[Dict[str, Any]]) -> None:
     """Store a list of price or trade entries into the database.
 
     Each dictionary is checked with :func:`validate_data` before insertion.
-    Example item::
-
-        {'timestamp': '2025-08-05T00:00:00', 'spot_symbol': 'BTC/USDT',
-         'futures_symbol': 'BTCUSDT', 'spot_bid': 59990, 'futures_ask': 60000}
+    To keep every batch either fully written or fully discarded we explicitly
+    start a transaction (``BEGIN IMMEDIATE``).  If anything goes wrong we roll
+    back so no half-complete rows linger.
     """
     if not validate_data(data):
         return
@@ -245,6 +248,7 @@ async def save_data(data: List[Dict[str, Any]]) -> None:
     for attempt in range(1, 4):
         conn = await _get_conn()
         try:
+            await conn.execute("BEGIN IMMEDIATE")
             await conn.executemany(
                 """
                 INSERT INTO trades (
@@ -253,6 +257,11 @@ async def save_data(data: List[Dict[str, Any]]) -> None:
                 ) VALUES (:timestamp, :spot_symbol, :futures_symbol,
                           :spot_bid, :futures_ask,
                           :trade_qty, :funding_rate)
+                ON CONFLICT(timestamp, spot_symbol, futures_symbol) DO UPDATE SET
+                    spot_bid=excluded.spot_bid,
+                    futures_ask=excluded.futures_ask,
+                    trade_qty=excluded.trade_qty,
+                    funding_rate=excluded.funding_rate
                 """,
                 [
                     {
@@ -271,6 +280,10 @@ async def save_data(data: List[Dict[str, Any]]) -> None:
             logger.info("Saved %d rows", len(data))
             return
         except Exception as exc:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
             logger.error("Failed to save data (attempt %d/3): %s", attempt, exc)
             if attempt == 3:
                 try:
@@ -297,7 +310,8 @@ async def query_data(
     parallel: bool = False,
     chunk_days: int = 30,
     max_concurrency: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+    as_dataframe: bool = False,
+) -> Union[List[Dict[str, Any]], pd.DataFrame]:
     """Return records for a pair between two dates.
 
     Optional filters narrow results by quantity and funding rate.  Setting
@@ -348,7 +362,7 @@ async def query_data(
                     rows = await cursor.fetchall()
                     cols = [c[0] for c in cursor.description]
                     df = pd.DataFrame(rows, columns=cols)
-                    return df.to_dict("records")
+                    return df if as_dataframe else df.to_dict("records")
             except Exception as exc:
                 logger.error("Parallel query chunk failed: %s", exc)
                 try:
@@ -365,7 +379,7 @@ async def query_data(
             rows = await cursor.fetchall()
             cols = [c[0] for c in cursor.description]
             df = pd.DataFrame(rows, columns=cols)
-            return df.to_dict("records")
+            return df if as_dataframe else df.to_dict("records")
         except Exception as exc:
             logger.error("Query failed: %s", exc)
             try:
@@ -397,6 +411,8 @@ async def query_data(
             except Exception:
                 pass
     results.sort(key=lambda x: x["timestamp"])
+    if as_dataframe:
+        return pd.DataFrame(results)
     return results
 
 
@@ -457,6 +473,27 @@ async def backup_database(compress: bool = True) -> None:
     except Exception as exc:
         logger.error("Database backup failed: %s", exc)
         await notify("Database backup failed", str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 4b. async vacuum_db
+# ---------------------------------------------------------------------------
+async def vacuum_db() -> None:
+    """Compact the database file by running ``VACUUM``.
+
+    While WAL mode already keeps the database stable, an occasional VACUUM
+    reclaims disk space after massive deletes.  It is safe to run while no
+    other transactions are active and typically only needed during
+    maintenance windows.
+    """
+    conn = await _get_conn()
+    try:
+        await conn.execute("VACUUM")
+        await conn.commit()
+        logger.info("Database vacuum completed")
+    except Exception as exc:  # pragma: no cover - rare
+        logger.error("Database vacuum failed: %s", exc)
+        await notify("Database vacuum failed", str(exc))
 
 
 # ---------------------------------------------------------------------------
