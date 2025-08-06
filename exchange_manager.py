@@ -12,13 +12,14 @@ import asyncio
 import json
 import time
 from typing import Awaitable, Callable, Dict, List
+from collections import Counter
 
 import ccxt.async_support as ccxt
 
 # Graceful fallbacks if the lightweight test stub lacks these classes
-RateLimitExceeded = getattr(ccxt, "RateLimitExceeded", Exception)
-NetworkError = getattr(ccxt, "NetworkError", Exception)
-ExchangeError = getattr(ccxt, "ExchangeError", Exception)
+RateLimitExceeded = getattr(ccxt, "RateLimitExceeded", type("RateLimitExceeded", (Exception,), {}))
+NetworkError = getattr(ccxt, "NetworkError", type("NetworkError", (Exception,), {}))
+ExchangeError = getattr(ccxt, "ExchangeError", type("ExchangeError", (Exception,), {}))
 
 from config import (
     CONFIG,
@@ -35,7 +36,7 @@ from logger import get_logger
 # server can be started to expose runtime metrics for systems such as Grafana or
 # Prometheus.
 try:  # pragma: no cover - metrics optional in tests
-    from prometheus_client import Gauge, start_http_server
+    from prometheus_client import Counter, Gauge, start_http_server
 
     _PROM_HEALTH = Gauge(
         "exchange_last_health_seconds",
@@ -47,6 +48,11 @@ try:  # pragma: no cover - metrics optional in tests
         "Latency of the last health check",
         ["exchange"],
     )
+    _PROM_ERRORS = Counter(
+        "exchange_errors_total",
+        "Number of API/health errors grouped by exchange and type",
+        ["exchange", "type"],
+    )
 
     def start_metrics_server(port: int = 8000) -> None:
         """Start an HTTP server exposing Prometheus metrics."""
@@ -54,7 +60,7 @@ try:  # pragma: no cover - metrics optional in tests
         start_http_server(port)
 
 except Exception:  # pragma: no cover - library missing
-    _PROM_HEALTH = _PROM_LATENCY = None
+    _PROM_HEALTH = _PROM_LATENCY = _PROM_ERRORS = None
 
     def start_metrics_server(port: int = 8000) -> None:
         """Fallback when :mod:`prometheus_client` is not available."""
@@ -105,6 +111,9 @@ _DEFAULT_RETRIES = get_request_retries()
 _RETRY_DELAY = get_request_retry_delay()
 _REQUEST_LIMIT = get_exchange_request_limit()
 _RATE_LIMITERS: Dict[str, asyncio.Semaphore] = {}
+
+# Error counters grouped by exchange and error type for production monitoring.
+_ERROR_STATS: Counter = Counter()
 
 # Optional listeners notified whenever a health check completes.  Each callback
 # receives ``(exchange_name, healthy, info)`` where ``info`` is a short string
@@ -165,6 +174,15 @@ def _rate_limiter(name: str) -> asyncio.Semaphore:
     return sem
 
 
+def _record_error(name: str, kind: str) -> None:
+    """Aggregate error ``kind`` for ``name`` and update metrics."""
+
+    key = f"{name}:{kind}"
+    _ERROR_STATS[key] += 1
+    if _PROM_ERRORS:
+        _PROM_ERRORS.labels(name, kind).inc()
+
+
 def register_health_listener(
     callback: Callable[[str, bool, str], Awaitable[None]]
 ) -> None:
@@ -219,56 +237,75 @@ async def monitor_rate_limits(threshold: float | None = None) -> Dict[str, int]:
 
 
 async def _call_with_retries(
-    func: Callable[[], Awaitable], name: str, action: str
+    func: Callable[[], Awaitable], name: str, action: str, *, detail: str = ""
 ):
-    """Run ``func`` with retries for network and rate limit errors."""
+    """Run ``func`` with retries for network and rate limit errors.
+
+    ``detail`` can supply contextual information such as the affected symbol, so
+    production logs and monitoring systems receive richer diagnostics.
+    """
 
     for attempt in range(1, _DEFAULT_RETRIES + 1):
+        start = time.perf_counter()
         try:
             return await func()
         except (RateLimitExceeded, NetworkError, ExchangeError) as exc:
+            elapsed = time.perf_counter() - start
             err_type = type(exc).__name__
+            _record_error(name, err_type)
+            extra = f" {detail}" if detail else ""
             if attempt == _DEFAULT_RETRIES:
                 logger.error(
-                    "%s failed for %s after %d attempts (%s): %s",
+                    "%s failed for %s after %d attempts (%s, %.3fs)%s: %s",
                     action,
                     name,
                     attempt,
                     err_type,
+                    elapsed,
+                    extra,
                     exc,
                 )
                 await notify(f"{action} failed", f"{name}: {exc}")
                 raise
             logger.warning(
-                "%s error for %s (attempt %d/%d, %s): %s",
+                "%s error for %s (attempt %d/%d, %s, %.3fs)%s: %s",
                 action,
                 name,
                 attempt,
                 _DEFAULT_RETRIES,
                 err_type,
+                elapsed,
+                extra,
                 exc,
             )
             await asyncio.sleep(_RETRY_DELAY)
         except Exception as exc:  # pragma: no cover - unexpected
+            elapsed = time.perf_counter() - start
             err_type = type(exc).__name__
+            _record_error(name, err_type)
+            extra = f" {detail}" if detail else ""
             if attempt == _DEFAULT_RETRIES:
                 logger.error(
-                    "%s unexpected failure for %s after %d attempts (%s): %s",
+                    "%s unexpected failure for %s after %d attempts (%s, %.3fs)%s: %s",
                     action,
                     name,
                     attempt,
                     err_type,
+                    elapsed,
+                    extra,
                     exc,
                 )
                 await notify(f"{action} failed", f"{name}: {exc}")
                 raise
             logger.warning(
-                "%s unexpected error for %s (attempt %d/%d, %s): %s",
+                "%s unexpected error for %s (attempt %d/%d, %s, %.3fs)%s: %s",
                 action,
                 name,
                 attempt,
                 _DEFAULT_RETRIES,
                 err_type,
+                elapsed,
+                extra,
                 exc,
             )
             await asyncio.sleep(_RETRY_DELAY)
@@ -301,7 +338,9 @@ async def _probe_exchange(name: str) -> float | None:
     start = time.perf_counter()
     try:
         async with _rate_limiter(name):
-            await _call_with_retries(client.fetch_time, name, "fetch_time")
+            await _call_with_retries(
+                client.fetch_time, name, "fetch_time", detail="latency probe"
+            )
     except Exception as exc:
         logger.error("Latency probe failed for %s: %s", name, exc)
         return None
@@ -495,7 +534,9 @@ async def get_markets(exchange_name: str, ttl: int = 300) -> Dict:
         client = _EXCHANGES[name]
 
     async with _rate_limiter(name):
-        markets = await _call_with_retries(client.load_markets, name, "load_markets")
+        markets = await _call_with_retries(
+            client.load_markets, name, "load_markets", detail="sync pairs"
+        )
 
     if not isinstance(markets, dict) or not markets:
         logger.error("%s returned invalid markets payload: %r", name, markets)
@@ -628,7 +669,10 @@ async def check_exchange_health(exchange_name: str) -> bool:
         start = time.perf_counter()
         async with _rate_limiter(name):
             await asyncio.wait_for(
-                _call_with_retries(client.fetch_time, name, "fetch_time"), timeout=10
+                _call_with_retries(
+                    client.fetch_time, name, "fetch_time", detail="health check"
+                ),
+                timeout=10,
             )
         latency = time.perf_counter() - start
         _PING_TIMES[name] = latency
@@ -661,6 +705,7 @@ async def check_exchange_health(exchange_name: str) -> bool:
 
     failures = _FAIL_COUNTS.get(name, 0) + 1
     _FAIL_COUNTS[name] = failures
+    _record_error(name, err_kind)
     last = _last_health.get(name, 0)
     downtime = now - last
     logger.warning(
@@ -760,4 +805,5 @@ def collect_metrics() -> Dict[str, Dict[str, float | int | str]]:
         "last_health": dict(_last_health),
         "fail_counts": dict(_FAIL_COUNTS),
         "latency": dict(_PING_TIMES),
+        "error_counts": dict(_ERROR_STATS),
     }

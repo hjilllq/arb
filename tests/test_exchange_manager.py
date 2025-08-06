@@ -39,6 +39,7 @@ def reset_state():
     em._RATE_LIMITERS.clear()
     em._HEALTH_LISTENERS.clear()
     em._FAIL_COUNTS.clear()
+    em._ERROR_STATS.clear()
     em._RETRY_DELAY = 0
     em._DEFAULT_RETRIES = 1
     yield
@@ -241,6 +242,20 @@ async def test_collect_metrics(monkeypatch):
     assert metrics["active_exchange"] == "bybit"
     assert metrics["fail_counts"]["bybit"] == 2
     assert metrics["latency"]["bybit"] == 0.1
+
+
+@pytest.mark.asyncio
+async def test_error_stats(monkeypatch):
+    monkeypatch.setattr(ccxt, "bybit", lambda config=None: DummyClient(fail_fetch=True))
+    monkeypatch.setattr(ccxt, "binance", lambda config=None: DummyClient())
+
+    await em.add_exchange("bybit", "k", "s")
+    await em.add_exchange("binance", "k", "s")
+    em._last_health["bybit"] = time.time()
+    await em.check_exchange_health("bybit")
+
+    metrics = em.collect_metrics()
+    assert metrics["error_counts"]["bybit:network"] == 1
 
 
 @pytest.mark.asyncio
