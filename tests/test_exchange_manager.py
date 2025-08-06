@@ -509,3 +509,32 @@ async def test_rate_limiter_isolation_across_exchanges():
 
     # Because semaphores are per exchange, start times should be near-identical
     assert abs(times[1] - times[0]) < 0.05
+
+
+@pytest.mark.asyncio
+async def test_cleanup_inactive_exchanges_removes_idle(monkeypatch):
+    monkeypatch.setattr(ccxt, "bybit", lambda config=None: DummyClient())
+    await em.add_exchange("bybit", "k", "s")
+    em._active_exchange = "binance"  # ensure not active
+    em._STATES["bybit"].last_health = time.time() - 4000
+
+    removed = await em.cleanup_inactive_exchanges(timeout=3600)
+    assert removed == 1
+    assert "bybit" not in em._STATES
+
+
+@pytest.mark.asyncio
+async def test_health_failure_records_latency(monkeypatch):
+    class SlowFail(DummyClient):
+        async def fetch_time(self):  # type: ignore[override]
+            await asyncio.sleep(0.05)
+            raise ccxt.NetworkError("offline")
+
+    monkeypatch.setattr(ccxt, "bybit", lambda config=None: SlowFail())
+    await em.add_exchange("bybit", "k", "s")
+    em._active_exchange = None
+    em._STATES["bybit"].last_health = time.time()
+
+    ok = await em.check_exchange_health("bybit")
+    assert not ok
+    assert em._STATES["bybit"].ping > 0

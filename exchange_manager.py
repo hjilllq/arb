@@ -906,8 +906,8 @@ async def check_exchange_health(exchange_name: str) -> bool:
         logger.error("Exchange %s not registered", name)
         return False
     err = None
+    start = time.perf_counter()
     try:
-        start = time.perf_counter()
         async with _rate_limiter(name):
             await asyncio.wait_for(
                 _call_with_retries(
@@ -920,15 +920,19 @@ async def check_exchange_health(exchange_name: str) -> bool:
             state.ping = latency
         _METRICS.record_latency(name, latency)
     except RateLimitExceeded as exc:
+        latency = time.perf_counter() - start
         err_kind = "rate limit"
         err = exc
     except (NetworkError, asyncio.TimeoutError) as exc:
+        latency = time.perf_counter() - start
         err_kind = "network"
         err = exc
     except ExchangeError as exc:
+        latency = time.perf_counter() - start
         err_kind = "api"
         err = exc
     except Exception as exc:  # pragma: no cover - unexpected
+        latency = time.perf_counter() - start
         err_kind = "unknown"
         err = exc
     else:
@@ -950,10 +954,14 @@ async def check_exchange_health(exchange_name: str) -> bool:
     _record_error(name, err_kind)
     last = state.last_health if state else 0
     downtime = now - last
+    if state:
+        state.ping = latency
+    _METRICS.record_latency(name, latency)
     logger.warning(
-        "Health check %s error for %s (failure %d, downtime %.1fs): %s",
+        "Health check %s error for %s (latency %.3fs, failure %d, downtime %.1fs): %s",
         err_kind,
         name,
+        latency,
         failures,
         downtime,
         err,
@@ -1029,7 +1037,42 @@ async def remove_exchange(exchange_name: str, downtime: float | None = None) -> 
 
 
 # ---------------------------------------------------------------------------
-# 8. close_all_exchanges
+# 8. cleanup_inactive_exchanges
+# ---------------------------------------------------------------------------
+async def cleanup_inactive_exchanges(timeout: int = 3600) -> int:
+    """Remove exchanges that have been idle for longer than ``timeout`` seconds.
+
+    Only exchanges that are *not* currently active are considered.  This keeps
+    the manager lightweight by closing connections that have been unused for a
+    long period of time, for example when a backup exchange was never needed.
+
+    Parameters
+    ----------
+    timeout:
+        Seconds of inactivity after which an exchange will be removed.  The
+        default of one hour keeps resource usage small without aggressive churn.
+
+    Returns
+    -------
+    int
+        Number of exchanges that were removed.
+    """
+
+    now = time.time()
+    removed = 0
+    for name, state in list(_STATES.items()):
+        if name == _active_exchange:
+            continue
+        if now - state.last_health > timeout:
+            await remove_exchange(name)
+            removed += 1
+    if removed:
+        logger.info("Removed %d inactive exchange(s)", removed)
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# 9. close_all_exchanges
 # ---------------------------------------------------------------------------
 async def close_all_exchanges() -> None:
     """Close all ccxt clients to free network resources."""
@@ -1041,9 +1084,12 @@ async def close_all_exchanges() -> None:
                 await client.close()
             except Exception:
                 pass
-    _STATES.clear()
+_STATES.clear()
 
 
+# ---------------------------------------------------------------------------
+# 10. collect_metrics
+# ---------------------------------------------------------------------------
 def collect_metrics() -> Dict[str, Dict[str, float | int | str]]:
     """Return internal counters for external monitoring systems.
 
