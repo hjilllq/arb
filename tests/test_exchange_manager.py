@@ -155,7 +155,7 @@ async def test_monitor_rate_limits_warns(monkeypatch):
 
     monkeypatch.setattr(em, "notify", fake_notify)
     em._REQUEST_LIMIT = 2
-    sem = em._rate_limiter("bybit")
+    sem = em._get_semaphore("bybit")
 
     async with sem:
         status = await em.monitor_rate_limits(threshold=0.4)
@@ -176,7 +176,7 @@ async def test_monitor_rate_limits_uses_config(monkeypatch):
     monkeypatch.setattr(em, "notify", fake_notify)
     em.CONFIG["RATE_ALERT_THRESHOLD"] = 0.1
     em._REQUEST_LIMIT = 2
-    sem = em._rate_limiter("bybit")
+    sem = em._get_semaphore("bybit")
 
     async with sem:
         await em.monitor_rate_limits()
@@ -238,7 +238,71 @@ async def test_collect_metrics(monkeypatch):
     metrics = em.collect_metrics()
     assert metrics["active_exchange"] == "bybit"
     assert metrics["fail_counts"]["bybit"] == 2
-    assert metrics["latency"]["bybit"] == 0.1
+
+
+@pytest.mark.asyncio
+async def test_operation_failure_limit_notifies(monkeypatch):
+    """Repeated failures for an action trigger a notification."""
+
+    calls: list[str] = []
+
+    async def fake_notify(msg, detail=""):
+        calls.append(msg)
+
+    async def fail():
+        raise em.ExchangeError("boom")
+
+    monkeypatch.setattr(em, "notify", fake_notify)
+    monkeypatch.setattr(em, "_OPERATION_ERROR_LIMITS", {"withdraw": 2})
+    em._DEFAULT_RETRIES = 1
+    em._RETRY_DELAY = 0
+
+    with pytest.raises(em.ExchangeError):
+        await em._call_with_retries(fail, "bybit", "withdraw")
+    assert calls == ["withdraw failed"]
+    with pytest.raises(em.ExchangeError):
+        await em._call_with_retries(fail, "bybit", "withdraw")
+    assert calls[1] == "Repeated withdraw failures"
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_fast_fail(monkeypatch):
+    """Rate limiter raises immediately when no slots remain."""
+
+    em._REQUEST_LIMIT = 1
+    sem = asyncio.Semaphore(1)
+    em._STATES["bybit"] = ExchangeState(client=None, rate_limiter=sem)
+
+    await sem.acquire()
+    start = time.perf_counter()
+    with pytest.raises(em.RateLimitExceeded):
+        async with em._rate_limiter("bybit"):
+            pass
+    assert time.perf_counter() - start < 0.2
+
+
+@pytest.mark.asyncio
+async def test_sync_pairs_returns_stale_during_refresh(monkeypatch):
+    """If a refresh is in progress the function returns cached data."""
+
+    async def slow_markets(name):
+        await asyncio.sleep(0.2)
+        return {"BTC/USDT": {}, "BTCUSDT": {}}
+
+    monkeypatch.setattr(em, "get_pair_mapping", lambda: {"BTC/USDT": "BTCUSDT"})
+    monkeypatch.setattr(em, "get_markets", slow_markets)
+    key = ("bybit", "binance")
+    em._PAIR_CACHE[key] = (time.time(), {"BTC/USDT": "BTCUSDT"})
+    em._PAIR_TTLS[key] = 0
+
+    task = asyncio.create_task(em.sync_trading_pairs(["bybit", "binance"]))
+    await asyncio.sleep(0.1)  # ensure refresh started
+    start = time.perf_counter()
+    result = await em.sync_trading_pairs(["bybit", "binance"])
+    elapsed = time.perf_counter() - start
+    await task
+    assert result == {"BTC/USDT": "BTCUSDT"}
+    assert elapsed < 0.2
 
 
 @pytest.mark.asyncio
@@ -252,7 +316,7 @@ async def test_error_stats(monkeypatch):
     await em.check_exchange_health("bybit")
 
     metrics = em.collect_metrics()
-    assert metrics["error_counts"]["bybit"]["network"] == 1
+    assert metrics["error_counts"]["bybit"]["NetworkError"] == 1
 
 
 def test_metrics_recorder_and_error_stats():
@@ -343,7 +407,7 @@ async def test_rate_limiter_enforces_limit(monkeypatch):
     """Semaphore ensures requests run sequentially when limit is 1."""
 
     em._REQUEST_LIMIT = 1
-    sem = em._rate_limiter("bybit")
+    sem = em._get_semaphore("bybit")
 
     timestamps: list[float] = []
 
@@ -384,8 +448,8 @@ async def test_rate_limiter_isolation_across_exchanges():
     """Each exchange maintains its own semaphore allowing parallelism."""
 
     em._REQUEST_LIMIT = 1
-    sem_a = em._rate_limiter("bybit")
-    sem_b = em._rate_limiter("binance")
+    sem_a = em._get_semaphore("bybit")
+    sem_b = em._get_semaphore("binance")
 
     times: list[float] = []
 

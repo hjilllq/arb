@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, List, Protocol
 from collections import defaultdict
+from contextlib import asynccontextmanager
 
 import ccxt.async_support as ccxt
 
@@ -146,8 +147,12 @@ _STATES: Dict[str, ExchangeState] = {}
 _active_exchange: str | None = None
 # Small cache to avoid reloading markets too often: name -> (timestamp, markets)
 _MARKET_CACHE: Dict[str, tuple[float, Dict]] = {}
+# Locks to ensure only one coroutine refreshes markets for a given exchange.
+_MARKET_LOCKS: Dict[str, asyncio.Lock] = {}
 # Small cache for pair synchronization: key (tuple of exchanges) -> (timestamp, mapping)
 _PAIR_CACHE: Dict[tuple[str, ...], tuple[float, Dict[str, str]]] = {}
+# Prevent concurrent pair refreshes to avoid blocking other tasks.
+_PAIR_LOCKS: Dict[tuple[str, ...], asyncio.Lock] = {}
 # Adaptive TTL so the cache refreshes faster when mappings change often and
 # slows down during quiet periods.  Values in seconds and configurable via
 # ``config.py`` using ``PAIR_TTL_MIN``, ``PAIR_TTL_MAX`` and ``PAIR_TTL_STEP``.
@@ -226,14 +231,21 @@ def _get_backup_candidates() -> List[str]:
     return [str(CONFIG.get("BACKUP_EXCHANGE", "binance")).lower()]
 
 
-def _rate_limiter(name: str) -> asyncio.Semaphore:
-    """Return a semaphore limiting concurrent requests for ``name``."""
+def _record_error(name: str, kind: str) -> None:
+    """Aggregate error ``kind`` for ``name`` and update metrics."""
+
+    _ERROR_STATS[name][kind] += 1
+    _METRICS.record_error(name, kind)
+
+
+def _get_semaphore(name: str) -> asyncio.Semaphore:
+    """Return (and lazily create) the semaphore for ``name``."""
 
     state = _STATES.get(name)
     if state is None:
-        state = ExchangeState(client=None, rate_limiter=asyncio.Semaphore(_REQUEST_LIMIT))
-        _STATES[name] = state
-        return state.rate_limiter  # type: ignore[return-value]
+        sem = asyncio.Semaphore(_REQUEST_LIMIT)
+        _STATES[name] = ExchangeState(client=None, rate_limiter=sem)
+        return sem
     sem = state.rate_limiter
     if sem is None:
         sem = asyncio.Semaphore(_REQUEST_LIMIT)
@@ -241,11 +253,48 @@ def _rate_limiter(name: str) -> asyncio.Semaphore:
     return sem
 
 
-def _record_error(name: str, kind: str) -> None:
-    """Aggregate error ``kind`` for ``name`` and update metrics."""
+@asynccontextmanager
+async def _rate_limiter(name: str):
+    """Limit concurrent requests for ``name`` failing fast when busy."""
 
-    _ERROR_STATS[name][kind] += 1
-    _METRICS.record_error(name, kind)
+    sem = _get_semaphore(name)
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=0.1)
+    except asyncio.TimeoutError:
+        _record_error(name, "rate_limit")
+        raise RateLimitExceeded(f"{name} rate limit reached")
+    try:
+        yield
+    finally:
+        sem.release()
+
+
+# Track specific operation failures such as withdrawals so the bot can react
+# when an action repeatedly fails (e.g. an exchange refusing all withdrawals).
+_OPERATION_ERROR_LIMITS = {
+    "withdraw": int(CONFIG.get("WITHDRAW_FAILURE_LIMIT", 3)),
+}
+_OPERATION_FAILURES: Dict[str, int] = defaultdict(int)
+
+
+def _record_operation_failure(action: str) -> bool:
+    """Increment failure count for ``action`` and report if threshold hit."""
+
+    limit = _OPERATION_ERROR_LIMITS.get(action)
+    if not limit:
+        return False
+    _OPERATION_FAILURES[action] += 1
+    if _OPERATION_FAILURES[action] >= limit:
+        _OPERATION_FAILURES[action] = 0
+        return True
+    return False
+
+
+def _reset_operation_failure(action: str) -> None:
+    """Reset failure counter for ``action`` after a successful call."""
+
+    if action in _OPERATION_FAILURES:
+        _OPERATION_FAILURES[action] = 0
 
 
 def get_error_stats(reset: bool = False) -> Dict[str, Dict[str, int]]:
@@ -340,7 +389,9 @@ async def _call_with_retries(
     for attempt in range(1, retries + 1):
         start = time.perf_counter()
         try:
-            return await func()
+            result = await func()
+            _reset_operation_failure(action)
+            return result
         except (RateLimitExceeded, NetworkError, ExchangeError) as exc:
             elapsed = time.perf_counter() - start
             err_type = type(exc).__name__
@@ -357,7 +408,13 @@ async def _call_with_retries(
                     extra,
                     exc,
                 )
-                await notify(f"{action} failed", f"{name}: {exc}")
+                if _record_operation_failure(action):
+                    await notify(
+                        f"Repeated {action} failures",
+                        f"{name}: {err_type} x{_OPERATION_ERROR_LIMITS.get(action)}",
+                    )
+                else:
+                    await notify(f"{action} failed", f"{name}: {exc}")
                 raise
             logger.warning(
                 "%s error for %s (attempt %d/%d, %s, %.3fs)%s: %s",
@@ -387,7 +444,13 @@ async def _call_with_retries(
                     extra,
                     exc,
                 )
-                await notify(f"{action} failed", f"{name}: {exc}")
+                if _record_operation_failure(action):
+                    await notify(
+                        f"Repeated {action} failures",
+                        f"{name}: {err_type} x{_OPERATION_ERROR_LIMITS.get(action)}",
+                    )
+                else:
+                    await notify(f"{action} failed", f"{name}: {exc}")
                 raise
             logger.warning(
                 "%s unexpected error for %s (attempt %d/%d, %s, %.3fs)%s: %s",
@@ -635,27 +698,35 @@ async def get_markets(exchange_name: str, ttl: int = 300) -> Dict:
     cached = _MARKET_CACHE.get(name)
     if cached and now - cached[0] < ttl:
         return cached[1]
+    lock = _MARKET_LOCKS.setdefault(name, asyncio.Lock())
+    if lock.locked() and cached:
+        return cached[1]
+    async with lock:
+        now = time.time()
+        cached = _MARKET_CACHE.get(name)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
 
-    state = _STATES.get(name)
-    client = state.client if state else None
-    if client is None:
-        key_field, secret_field = _KEY_MAP.get(name, ("", ""))
-        await add_exchange(name, CONFIG.get(key_field, ""), CONFIG.get(secret_field, ""))
-        state = _STATES[name]
-        client = state.client  # type: ignore[assignment]
+        state = _STATES.get(name)
+        client = state.client if state else None
+        if client is None:
+            key_field, secret_field = _KEY_MAP.get(name, ("", ""))
+            await add_exchange(name, CONFIG.get(key_field, ""), CONFIG.get(secret_field, ""))
+            state = _STATES[name]
+            client = state.client  # type: ignore[assignment]
 
-    async with _rate_limiter(name):
-        markets = await _call_with_retries(
-            client.load_markets, name, "load_markets", detail="sync pairs"
-        )
+        async with _rate_limiter(name):
+            markets = await _call_with_retries(
+                client.load_markets, name, "load_markets", detail="sync pairs"
+            )
 
-    if not isinstance(markets, dict) or not markets:
-        logger.error("%s returned invalid markets payload: %r", name, markets)
-        await notify("Invalid market data", f"{name} returned {type(markets).__name__}")
-        raise ExchangeError("invalid markets payload")
+        if not isinstance(markets, dict) or not markets:
+            logger.error("%s returned invalid markets payload: %r", name, markets)
+            await notify("Invalid market data", f"{name} returned {type(markets).__name__}")
+            raise ExchangeError("invalid markets payload")
 
-    _MARKET_CACHE[name] = (now, markets)
-    return markets
+        _MARKET_CACHE[name] = (now, markets)
+        return markets
 
 
 # ---------------------------------------------------------------------------
@@ -703,46 +774,57 @@ async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
     if cached and now - cached[0] < ttl:
         return cached[1]
 
-    # Load markets concurrently, reusing cached results where possible.
-    tasks = {name: asyncio.create_task(get_markets(name.lower())) for name in exchanges}
-    markets_by_exchange: Dict[str, Dict] = {}
-    try:
-        results = await asyncio.gather(*tasks.values())
-        for exch_name, markets in zip(tasks.keys(), results):
-            markets_by_exchange[exch_name.lower()] = markets
-    except NetworkError as exc:
-        logger.error("Network error during market sync: %s", exc)
-        await notify("Market sync network error", str(exc))
-        return {}
-    except ExchangeError as exc:
-        logger.error("API error during market sync: %s", exc)
-        await notify("Market sync API error", str(exc))
-        return {}
-    except Exception as exc:
-        logger.error("Market load failed: %s", exc)
-        await notify("Market sync failed", str(exc))
-        return {}
+    lock = _PAIR_LOCKS.setdefault(key, asyncio.Lock())
+    if lock.locked() and cached:
+        return cached[1]
 
-    valid_mapping: Dict[str, str] = {}
-    for spot_pair, fut_pair in mapping.items():
-        missing = []
-        for name in exchanges:
-            markets = markets_by_exchange.get(name.lower(), {})
-            if spot_pair not in markets or fut_pair not in markets:
-                missing.append(name)
-        if missing:
-            logger.warning("Pair %s/%s missing on %s", spot_pair, fut_pair, ", ".join(missing))
+    async with lock:
+        now = time.time()
+        cached = _PAIR_CACHE.get(key)
+        ttl = _PAIR_TTLS.get(key, _PAIR_TTL_MIN)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+
+        # Load markets concurrently, reusing cached results where possible.
+        tasks = {name: asyncio.create_task(get_markets(name.lower())) for name in exchanges}
+        markets_by_exchange: Dict[str, Dict] = {}
+        try:
+            results = await asyncio.gather(*tasks.values())
+            for exch_name, markets in zip(tasks.keys(), results):
+                markets_by_exchange[exch_name.lower()] = markets
+        except NetworkError as exc:
+            logger.error("Network error during market sync: %s", exc)
+            await notify("Market sync network error", str(exc))
+            return {}
+        except ExchangeError as exc:
+            logger.error("API error during market sync: %s", exc)
+            await notify("Market sync API error", str(exc))
+            return {}
+        except Exception as exc:
+            logger.error("Market load failed: %s", exc)
+            await notify("Market sync failed", str(exc))
+            return {}
+
+        valid_mapping: Dict[str, str] = {}
+        for spot_pair, fut_pair in mapping.items():
+            missing = []
+            for name in exchanges:
+                markets = markets_by_exchange.get(name.lower(), {})
+                if spot_pair not in markets or fut_pair not in markets:
+                    missing.append(name)
+            if missing:
+                logger.warning("Pair %s/%s missing on %s", spot_pair, fut_pair, ", ".join(missing))
+            else:
+                valid_mapping[spot_pair] = fut_pair
+        previous = cached[1] if cached else None
+        _PAIR_CACHE[key] = (now, valid_mapping)
+        if previous and previous != valid_mapping:
+            ttl = _PAIR_TTL_MIN
         else:
-            valid_mapping[spot_pair] = fut_pair
-    previous = cached[1] if cached else None
-    _PAIR_CACHE[key] = (now, valid_mapping)
-    if previous and previous != valid_mapping:
-        ttl = _PAIR_TTL_MIN
-    else:
-        ttl = min(ttl + _PAIR_TTL_STEP, _PAIR_TTL_MAX)
-    _PAIR_TTLS[key] = ttl
-    logger.info("Pair sync result: %s (ttl=%d s)", valid_mapping, ttl)
-    return valid_mapping
+            ttl = min(ttl + _PAIR_TTL_STEP, _PAIR_TTL_MAX)
+        _PAIR_TTLS[key] = ttl
+        logger.info("Pair sync result: %s (ttl=%d s)", valid_mapping, ttl)
+        return valid_mapping
 
 
 # ---------------------------------------------------------------------------
