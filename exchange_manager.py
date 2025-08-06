@@ -14,6 +14,11 @@ from typing import Dict, List
 
 import ccxt.async_support as ccxt
 
+# Graceful fallbacks if the lightweight test stub lacks these classes
+RateLimitExceeded = getattr(ccxt, "RateLimitExceeded", Exception)
+NetworkError = getattr(ccxt, "NetworkError", Exception)
+ExchangeError = getattr(ccxt, "ExchangeError", Exception)
+
 from config import CONFIG, get_pair_mapping
 from logger import get_logger
 
@@ -93,6 +98,9 @@ async def add_exchange(exchange_name: str, api_key: str, api_secret: str) -> Non
                 "apiKey": api_key,
                 "secret": api_secret,
                 "enableRateLimit": True,
+                # Use spot markets by default; futures can still be accessed
+                # by specifying contracts explicitly.
+                "options": {"defaultType": "spot"},
             }
         )
         _EXCHANGES[name] = client
@@ -188,15 +196,15 @@ async def get_markets(exchange_name: str, ttl: int = 300) -> Dict:
 
     try:
         markets = await client.load_markets()
-    except ccxt.RateLimitExceeded as exc:
+    except RateLimitExceeded as exc:
         logger.warning("Market load rate limited for %s: %s", name, exc)
         await notify("Rate limit", f"{name}: load_markets")
         raise
-    except ccxt.NetworkError as exc:
+    except NetworkError as exc:
         logger.warning("Network problem loading markets for %s: %s", name, exc)
         await notify("Network error", f"{name}: {exc}")
         raise
-    except ccxt.ExchangeError as exc:
+    except ExchangeError as exc:
         logger.error("API error loading markets for %s: %s", name, exc)
         await notify("Market load failed", f"{name}: {exc}")
         raise
@@ -255,11 +263,11 @@ async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
         results = await asyncio.gather(*tasks.values())
         for exch_name, markets in zip(tasks.keys(), results):
             markets_by_exchange[exch_name.lower()] = markets
-    except ccxt.NetworkError as exc:
+    except NetworkError as exc:
         logger.error("Network error during market sync: %s", exc)
         await notify("Market sync network error", str(exc))
         return {}
-    except ccxt.ExchangeError as exc:
+    except ExchangeError as exc:
         logger.error("API error during market sync: %s", exc)
         await notify("Market sync API error", str(exc))
         return {}
@@ -322,11 +330,11 @@ async def check_exchange_health(exchange_name: str) -> bool:
         return False
     try:
         await asyncio.wait_for(client.fetch_time(), timeout=10)
-    except ccxt.RateLimitExceeded as exc:
+    except RateLimitExceeded as exc:
         err_kind = "rate limit"
-    except (ccxt.NetworkError, asyncio.TimeoutError) as exc:
+    except (NetworkError, asyncio.TimeoutError) as exc:
         err_kind = "network"
-    except ccxt.ExchangeError as exc:
+    except ExchangeError as exc:
         err_kind = "api"
     except Exception as exc:  # pragma: no cover - unexpected
         err_kind = "unknown"
