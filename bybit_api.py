@@ -41,6 +41,8 @@ _CACHE_STATS = {
     "disk_misses": 0,
     "ticker_hits": 0,
     "ticker_misses": 0,
+    "disk_bytes": 0,
+    "ticker_entries": 0,
 }
 
 
@@ -71,6 +73,7 @@ async def monitor_cache_usage() -> None:
         return
 
     usage = size / limit
+    _CACHE_STATS["disk_bytes"] = size
     if usage >= 0.9:
         await logger.log_warning(
             f"Cache usage {size} bytes ({usage:.0%}) exceeds 90% of limit {limit}"
@@ -324,6 +327,7 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
     ttl = config.get_ticker_cache_ttl()
     if cached and now - cached[0] < ttl:
         _CACHE_STATS["ticker_hits"] += 1
+        _CACHE_STATS["ticker_entries"] = len(_TICKER_CACHE)
         return cached[1]
 
     _CACHE_STATS["ticker_misses"] += 1
@@ -341,6 +345,7 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
                 },
             }
             _TICKER_CACHE[key] = (now, data)
+            _CACHE_STATS["ticker_entries"] = len(_TICKER_CACHE)
             await database.save_data(
                 [
                     {
@@ -466,7 +471,11 @@ async def get_funding_rate_history(symbol: str, start_date: str, end_date: str) 
                 _CACHE_STATS["disk_misses"] += 1
             return data
         except Exception as exc:
-            await handle_api_error(exc, attempt, context=f"funding {symbol}")
+            await handle_api_error(
+                exc,
+                attempt,
+                context=f"funding {symbol} {start_date}-{end_date}",
+            )
             if attempt == 3:
                 return []
     return []
@@ -502,6 +511,7 @@ async def subscribe_to_websocket(
     topic = f"tickers.{api_symbol}"
     subscribe_msg = json.dumps({"op": "subscribe", "args": [topic]})
 
+    attempt = 1
     while True:
         try:
             async with aiohttp.ClientSession() as session:
@@ -517,7 +527,8 @@ async def subscribe_to_websocket(
                         received += 1
                     return
         except Exception as exc:
-            await handle_api_error(exc, context=f"websocket {symbol}")
+            await handle_api_error(exc, attempt, context=f"websocket {symbol}")
+            attempt += 1
             continue
 
 
@@ -689,6 +700,8 @@ async def handle_api_error(
     """
 
     message = context or "API error"
+    if attempt > 1:
+        message = f"{message} (attempt {attempt})"
     await logger.log_error(message, error)
     delay = min(5 * 2 ** (attempt - 1), 60)
     if isinstance(error, ccxt.RateLimitExceeded):

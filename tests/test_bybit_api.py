@@ -453,3 +453,28 @@ async def test_ticker_cache_disabled_with_zero_ttl(monkeypatch):
     await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
     # Each call fetches both spot and futures tickers (2 calls per request)
     assert bybit_api._client.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_cache_metrics_updated(monkeypatch, tmp_path):
+    """monitor_cache_usage should record size and ticker cache count."""
+
+    monkeypatch.setattr(bybit_api, "_CACHE_DIR", tmp_path)
+    file = tmp_path / "a.json"
+    file.write_text("x" * 10)
+    monkeypatch.setattr(bybit_api.config, "get_cache_max_bytes", lambda: 100)
+    await bybit_api.monitor_cache_usage()
+    stats = bybit_api.get_cache_stats()
+    assert stats["disk_bytes"] >= 10
+
+    class DummyClient:
+        async def fetch_ticker(self, symbol, params=None):
+            return {"bid": 1, "ask": 1}
+
+    bybit_api._client = DummyClient()
+    bybit_api._TICKER_CACHE.clear()
+    bybit_api._CACHE_STATS["ticker_entries"] = 0
+    monkeypatch.setattr(bybit_api.database, "save_data", lambda *a, **k: asyncio.sleep(0))
+    await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
+    stats = bybit_api.get_cache_stats()
+    assert stats["ticker_entries"] == 1
