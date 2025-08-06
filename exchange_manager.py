@@ -9,8 +9,9 @@ Apple Silicon M4 Max cool and efficient.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
-from typing import Dict, List
+from typing import Awaitable, Callable, Dict, List
 
 import ccxt.async_support as ccxt
 
@@ -60,11 +61,79 @@ _MAX_FAILURES = 5  # consecutive failures before extra notification
 _FAIL_SWITCH = 3
 _SWITCH_TIMEOUT = get_switch_backup_timeout()
 
+# Retry and rate-limit settings for graceful recovery under load.
+_DEFAULT_RETRIES = int(CONFIG.get("REQUEST_RETRIES", 3))
+_RETRY_DELAY = float(CONFIG.get("REQUEST_RETRY_DELAY", 5))
+_REQUEST_LIMIT = int(CONFIG.get("EXCHANGE_REQUEST_LIMIT", 5))
+_RATE_LIMITERS: Dict[str, asyncio.Semaphore] = {}
+
 # Helper mapping from logical names to config keys for API credentials.
 _KEY_MAP = {
     "bybit": ("API_KEY", "API_SECRET"),
     "binance": ("BACKUP_API_KEY", "BACKUP_API_SECRET"),
 }
+
+
+def _get_backup_candidates() -> List[str]:
+    """Return a prioritized list of backup exchanges.
+
+    ``BACKUP_EXCHANGES`` may be provided in :mod:`config` as a JSON list or a
+    comma separated string.  If absent, ``BACKUP_EXCHANGE`` or ``"binance"`` is
+    used.  Results are normalized to lower case.
+    """
+
+    raw = CONFIG.get("BACKUP_EXCHANGES")
+    if raw:
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(x).lower() for x in parsed if x]
+            except Exception:
+                return [s.strip().lower() for s in raw.split(",") if s.strip()]
+        if isinstance(raw, (list, tuple)):
+            return [str(x).lower() for x in raw if x]
+    return [str(CONFIG.get("BACKUP_EXCHANGE", "binance")).lower()]
+
+
+def _rate_limiter(name: str) -> asyncio.Semaphore:
+    """Return a semaphore limiting concurrent requests for ``name``."""
+
+    sem = _RATE_LIMITERS.get(name)
+    if sem is None:
+        sem = asyncio.Semaphore(_REQUEST_LIMIT)
+        _RATE_LIMITERS[name] = sem
+    return sem
+
+
+async def _call_with_retries(
+    func: Callable[[], Awaitable], name: str, action: str
+):
+    """Run ``func`` with retries for network and rate limit errors."""
+
+    for attempt in range(1, _DEFAULT_RETRIES + 1):
+        try:
+            return await func()
+        except (RateLimitExceeded, NetworkError, ExchangeError) as exc:
+            if attempt == _DEFAULT_RETRIES:
+                logger.error(
+                    "%s failed for %s after %d attempts: %s",
+                    action,
+                    name,
+                    attempt,
+                    exc,
+                )
+                await notify(f"{action} failed", f"{name}: {exc}")
+                raise
+            logger.warning(
+                "%s error for %s (attempt %d/%d): %s",
+                action,
+                name,
+                attempt,
+                _DEFAULT_RETRIES,
+                exc,
+            )
+            await asyncio.sleep(_RETRY_DELAY)
 
 
 async def _get_client_for_exchange(name: str) -> ccxt.Exchange:
@@ -132,25 +201,27 @@ async def add_exchange(exchange_name: str, api_key: str, api_secret: str) -> Non
 # 2. switch_to_backup_exchange
 # ---------------------------------------------------------------------------
 async def switch_to_backup_exchange() -> bool:
-    """Switch active exchange to the configured backup (usually Binance).
+    """Switch active exchange to the first available backup.
 
-    Returns ``True`` on success.  The backup is created on the fly if needed.
+    Multiple candidates can be supplied via ``BACKUP_EXCHANGES`` in the
+    configuration.  The first exchange that can be initialised becomes active.
+    Returns ``True`` on success.
     """
 
-    backup = CONFIG.get("BACKUP_EXCHANGE", "binance").lower()
     global _active_exchange
-    if _active_exchange == backup:
-        return True
-    try:
-        await _get_client_for_exchange(backup)
-        old = _active_exchange
-        _active_exchange = backup
-        logger.warning("Switching from %s to backup %s", old, backup)
-        return True
-    except Exception as exc:
-        logger.error("Failed to switch to backup %s: %s", backup, exc)
-        await notify("Backup switch failed", str(exc))
-        return False
+    for backup in _get_backup_candidates():
+        if _active_exchange == backup:
+            return True
+        try:
+            await _get_client_for_exchange(backup)
+            old = _active_exchange
+            _active_exchange = backup
+            logger.warning("Switching from %s to backup %s", old, backup)
+            return True
+        except Exception as exc:
+            logger.error("Failed to switch to backup %s: %s", backup, exc)
+            await notify("Backup switch failed", f"{backup}: {exc}")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -205,20 +276,9 @@ async def get_markets(exchange_name: str, ttl: int = 300) -> Dict:
         await add_exchange(name, CONFIG.get(key_field, ""), CONFIG.get(secret_field, ""))
         client = _EXCHANGES[name]
 
-    try:
-        markets = await client.load_markets()
-    except RateLimitExceeded as exc:
-        logger.warning("Market load rate limited for %s: %s", name, exc)
-        await notify("Rate limit", f"{name}: load_markets")
-        raise
-    except NetworkError as exc:
-        logger.warning("Network problem loading markets for %s: %s", name, exc)
-        await notify("Network error", f"{name}: {exc}")
-        raise
-    except ExchangeError as exc:
-        logger.error("API error loading markets for %s: %s", name, exc)
-        await notify("Market load failed", f"{name}: {exc}")
-        raise
+    async with _rate_limiter(name):
+        markets = await _call_with_retries(client.load_markets, name, "load_markets")
+
     _MARKET_CACHE[name] = (now, markets)
     return markets
 
@@ -341,7 +401,10 @@ async def check_exchange_health(exchange_name: str) -> bool:
         return False
     err = None
     try:
-        await asyncio.wait_for(client.fetch_time(), timeout=10)
+        async with _rate_limiter(name):
+            await asyncio.wait_for(
+                _call_with_retries(client.fetch_time, name, "fetch_time"), timeout=10
+            )
     except RateLimitExceeded as exc:
         err_kind = "rate limit"
         err = exc
