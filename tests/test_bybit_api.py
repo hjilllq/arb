@@ -36,7 +36,13 @@ class DummyClient:
 @pytest.mark.asyncio
 async def test_connect_api(monkeypatch):
     dummy = DummyClient()
-    monkeypatch.setattr(bybit_api.ccxt, "bybit", lambda cfg: dummy)
+    captured = {}
+
+    def fake_bybit(cfg):
+        captured.update(cfg)
+        return dummy
+
+    monkeypatch.setattr(bybit_api.ccxt, "bybit", fake_bybit)
     calls = {"spot": False, "fut": False, "map": False}
     monkeypatch.setattr(bybit_api.config, "get_spot_pairs", lambda: calls.__setitem__("spot", True) or [])
     monkeypatch.setattr(bybit_api.config, "get_futures_pairs", lambda: calls.__setitem__("fut", True) or [])
@@ -45,10 +51,12 @@ async def test_connect_api(monkeypatch):
     async def fake_log(msg):
         logs.append(msg)
     monkeypatch.setattr(bybit_api.logger, "log_info", fake_log)
-    await bybit_api.connect_api("k", "s")
+    await bybit_api.connect_api("k", "s", timeout_ms=1234, proxy="http://p")
     assert dummy.load_markets_called
     assert all(calls.values())
     assert "Connected" in logs[0]
+    assert captured["timeout"] == 1234
+    assert captured["proxies"]["http"] == "http://p"
 
 @pytest.mark.asyncio
 async def test_get_spot_futures_data(monkeypatch):
@@ -161,3 +169,23 @@ async def test_cancel_order_includes_symbol(monkeypatch):
     ok = await bybit_api.cancel_order("BTC-USDT", "42", "future")
     assert ok
     assert client.cancel_symbol == "BTCUSDT"
+
+
+@pytest.mark.asyncio
+async def test_place_order_validates_params(monkeypatch):
+    client = DummyClient()
+    bybit_api._client = client
+    errors = []
+
+    async def fake_err(msg, exc):
+        errors.append(msg)
+
+    monkeypatch.setattr(bybit_api.logger, "log_error", fake_err)
+    res = await bybit_api.place_order("BTCUSDT", "hold", 1, 1)
+    assert res == {}
+    assert any("Invalid order side" in m for m in errors)
+
+    errors.clear()
+    res = await bybit_api.place_order("BTCUSDT", "buy", 1, 1, order_type="stop")
+    assert res == {}
+    assert any("Invalid order type" in m for m in errors)

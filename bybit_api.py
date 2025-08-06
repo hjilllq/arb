@@ -42,28 +42,40 @@ def _normalize_futures_symbol(symbol: str) -> str:
 # ---------------------------------------------------------------------------
 # 1. connect_api
 # ---------------------------------------------------------------------------
-async def connect_api(api_key: str, api_secret: str) -> None:
+async def connect_api(
+    api_key: str,
+    api_secret: str,
+    *,
+    timeout_ms: int = 10_000,
+    proxy: Optional[str] = None,
+) -> None:
     """Connect to Bybit's REST API asynchronously.
 
     Parameters
     ----------
     api_key, api_secret:
-        Credentials for Bybit.  They can be plain strings or encrypted values
-        that were previously decrypted by :mod:`config`.
+        Credentials for Bybit. They can be plain strings or decrypted values
+        from :mod:`config`.
+    timeout_ms:
+        Maximum time in milliseconds to wait for each HTTP request.
+    proxy:
+        Optional proxy URL applied to both HTTP and HTTPS.
 
     Examples
     --------
-    >>> await connect_api('key', 'secret')  # doctest: +SKIP
+    >>> await connect_api('key', 'secret', timeout_ms=5_000)  # doctest: +SKIP
     """
     global _client
-    _client = ccxt.bybit(
-        {
-            "apiKey": api_key,
-            "secret": api_secret,
-            "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
-        }
-    )
+    cfg: Dict[str, Any] = {
+        "apiKey": api_key,
+        "secret": api_secret,
+        "enableRateLimit": True,
+        "timeout": timeout_ms,
+        "options": {"defaultType": "spot"},
+    }
+    if proxy:
+        cfg["proxies"] = {"http": proxy, "https": proxy}
+    _client = ccxt.bybit(cfg)
     try:
         await _client.load_markets()
         # Warm up configuration helpers so they are cached in memory and
@@ -275,8 +287,15 @@ async def subscribe_to_websocket(
     """Listen to live prices via Bybit's public WebSocket.
 
     The connection retries on failure and uses ping/pong messages to stay
-    healthy.  ``max_messages`` limits how many updates are processed before the
+    healthy. ``max_messages`` limits how many updates are processed before the
     function returns; use ``None`` for continuous streaming.
+
+    Notes
+    -----
+    Private channels (balances, order events) live at
+    ``wss://stream.bybit.com/v5/private`` and require an authenticated
+    handshake. This helper focuses on public price feeds but can be extended to
+    cover the private stream later.
     """
     url = (
         "wss://stream.bybit.com/v5/public/spot"
@@ -333,9 +352,19 @@ async def place_order(
         await logger.log_error("Bybit client not connected", RuntimeError("no client"))
         return {}
 
+    side_l = side.lower()
+    if side_l not in {"buy", "sell"}:
+        await logger.log_error("Invalid order side", ValueError(side))
+        return {}
+
+    type_l = order_type.lower()
+    if type_l not in {"limit", "market"}:
+        await logger.log_error("Invalid order type", ValueError(order_type))
+        return {}
+
     category = "spot" if contract_type == "spot" else "linear"
     api_symbol = symbol if contract_type == "spot" else _normalize_futures_symbol(symbol)
-    if order_type.lower() == "market":
+    if type_l == "market":
         price = None
     for attempt in range(1, 4):
         try:
