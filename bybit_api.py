@@ -46,11 +46,14 @@ async def connect_api(api_key: str, api_secret: str) -> None:
     >>> await connect_api('key', 'secret')  # doctest: +SKIP
     """
     global _client
-    _client = ccxt.bybit({
-        "apiKey": api_key,
-        "secret": api_secret,
-        "enableRateLimit": True,
-    })
+    _client = ccxt.bybit(
+        {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
+        }
+    )
     try:
         await _client.load_markets()
         # Warm up configuration helpers so they are cached in memory and
@@ -60,6 +63,11 @@ async def connect_api(api_key: str, api_secret: str) -> None:
         config.get_pair_mapping()
         await logger.log_info("Connected to Bybit API")
     except Exception as exc:
+        # Close the client on failure to avoid dangling connections.
+        try:
+            await _client.close()
+        finally:
+            _client = None
         await handle_api_error(exc)
 
 
@@ -105,36 +113,42 @@ async def get_historical_data(
 
     since = int(datetime.fromisoformat(start_date).timestamp() * 1000)
     until = int(datetime.fromisoformat(end_date).timestamp() * 1000)
-
     category = "spot" if contract_type == "spot" else "linear"
+
     results: List[Dict[str, Any]] = []
-    for attempt in range(1, 4):
-        try:
-            ohlcv = await _client.fetch_ohlcv(
-                symbol,
-                timeframe,
-                since=since,
-                params={"until": until, "category": category},
-            )
-            for row in ohlcv:
-                results.append(
-                    {
-                        "timestamp": datetime.utcfromtimestamp(row[0] / 1000).isoformat(),
-                        "open": row[1],
-                        "high": row[2],
-                        "low": row[3],
-                        "close": row[4],
-                        "volume": row[5],
-                    }
+    while since < until:
+        for attempt in range(1, 4):
+            try:
+                ohlcv = await _client.fetch_ohlcv(
+                    symbol,
+                    timeframe,
+                    since=since,
+                    limit=200,
+                    params={"category": category},
                 )
-            if not results:
-                await logger.log_warning(f"No historical data for {symbol}")
-            return results
-        except Exception as exc:
-            if attempt == 3:
-                await handle_api_error(exc)
-                return []
-            await asyncio.sleep(5)
+                break
+            except Exception as exc:
+                await handle_api_error(exc, attempt)
+                if attempt == 3:
+                    return results
+        if not ohlcv:
+            break
+        for row in ohlcv:
+            results.append(
+                {
+                    "timestamp": datetime.utcfromtimestamp(row[0] / 1000).isoformat(),
+                    "open": row[1],
+                    "high": row[2],
+                    "low": row[3],
+                    "close": row[4],
+                    "volume": row[5],
+                }
+            )
+        since = ohlcv[-1][0] + 1
+        if ohlcv[-1][0] >= until:
+            break
+    if not results:
+        await logger.log_warning(f"No historical data for {symbol}")
     return results
 
 
@@ -174,8 +188,6 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
                     "ask": fut_ticker.get("ask"),
                 },
             }
-            # Save a slim snapshot to the database so history can be analysed
-            # later.  Only the required fields are stored.
             await database.save_data(
                 [
                     {
@@ -189,10 +201,9 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
             )
             return data
         except Exception as exc:
+            await handle_api_error(exc, attempt)
             if attempt == 3:
-                await handle_api_error(exc)
                 return {}
-            await asyncio.sleep(5)
     return {}
 
 
@@ -233,22 +244,25 @@ async def get_funding_rate_history(symbol: str, start_date: str, end_date: str) 
                 for r in fr
             ]
         except Exception as exc:
+            await handle_api_error(exc, attempt)
             if attempt == 3:
-                await handle_api_error(exc)
                 return []
-            await asyncio.sleep(5)
     return []
 
 
 # ---------------------------------------------------------------------------
 # 5. subscribe_to_websocket
 # ---------------------------------------------------------------------------
-async def subscribe_to_websocket(symbol: str, contract_type: str = "spot") -> None:
+async def subscribe_to_websocket(
+    symbol: str,
+    contract_type: str = "spot",
+    max_messages: Optional[int] = 3,
+) -> None:
     """Listen to live prices via Bybit's public WebSocket.
 
-    This function opens a WebSocket, subscribes to ticker updates, prints a few
-    messages and then closes gracefully.  It's like holding a walkie-talkie for
-    a short chat.
+    The connection retries on failure and uses ping/pong messages to stay
+    healthy.  ``max_messages`` limits how many updates are processed before the
+    function returns; use ``None`` for continuous streaming.
     """
     url = (
         "wss://stream.bybit.com/v5/public/spot"
@@ -257,18 +271,24 @@ async def subscribe_to_websocket(symbol: str, contract_type: str = "spot") -> No
     )
     topic = f"tickers.{symbol}"
     subscribe_msg = json.dumps({"op": "subscribe", "args": [topic]})
-    async with aiohttp.ClientSession() as session:
+
+    while True:
         try:
-            async with session.ws_connect(url, heartbeat=20) as ws:
-                await ws.send_str(subscribe_msg)
-                for _ in range(3):  # read a few messages then stop
-                    msg = await ws.receive(timeout=20)
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        await logger.log_info(f"WS message: {msg.data[:60]}")
-                    await ws.send_str(json.dumps({"op": "ping"}))
-                    await asyncio.sleep(1)
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(url, heartbeat=20) as ws:
+                    await ws.send_str(subscribe_msg)
+                    received = 0
+                    while max_messages is None or received < max_messages:
+                        msg = await ws.receive(timeout=20)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            await logger.log_info(f"WS message: {msg.data[:60]}")
+                        await ws.send_str(json.dumps({"op": "ping"}))
+                        await asyncio.sleep(1)
+                        received += 1
+                    return
         except Exception as exc:
             await handle_api_error(exc)
+            continue
 
 
 # ---------------------------------------------------------------------------
@@ -312,10 +332,9 @@ async def place_order(
             await logger.log_info(f"Placed order {order.get('id')}")
             return {"order_id": order.get("id")}
         except Exception as exc:
+            await handle_api_error(exc, attempt)
             if attempt == 3:
-                await handle_api_error(exc)
                 return {}
-            await asyncio.sleep(5)
     return {}
 
 
@@ -346,10 +365,9 @@ async def cancel_order(order_id: str, contract_type: str = "spot") -> bool:
             await logger.log_info(f"Cancelled order {order_id}")
             return True
         except Exception as exc:
+            await handle_api_error(exc, attempt)
             if attempt == 3:
-                await handle_api_error(exc)
                 return False
-            await asyncio.sleep(5)
     return False
 
 
@@ -374,10 +392,9 @@ async def get_balance() -> Dict[str, Any]:
             balance = await _client.fetch_balance()
             return balance.get("total", {})
         except Exception as exc:
+            await handle_api_error(exc, attempt)
             if attempt == 3:
-                await handle_api_error(exc)
                 return {}
-            await asyncio.sleep(5)
     return {}
 
 
@@ -403,18 +420,41 @@ async def cache_data(data: List[Dict[str, Any]]) -> None:
 # ---------------------------------------------------------------------------
 # 10. handle_api_error
 # ---------------------------------------------------------------------------
-async def handle_api_error(error: Exception) -> None:
-    """Log API errors and notify the operator.
+async def handle_api_error(error: Exception, attempt: int = 1) -> None:
+    """Log API errors, notify the operator and wait before retrying.
 
-    This is the safety net.  It whispers the problem to :mod:`logger` and then
-    taps the notification manager on the shoulder.
+    Parameters
+    ----------
+    error:
+        The exception raised by the API call.
+    attempt:
+        Current retry attempt starting from ``1``.  The delay grows
+        exponentially to calm down when the API is angry.
     """
+
     await logger.log_error("API error", error)
+    delay = min(5 * 2 ** (attempt - 1), 60)
+    if isinstance(error, ccxt.RateLimitExceeded):
+        delay *= 2
+    elif isinstance(error, (ccxt.NetworkError, ccxt.RequestTimeout)):
+        delay += 5
     try:
         from notification_manager import notify  # type: ignore
 
-        await notify("Bybit API error", str(error))
+        await notify("Bybit API error", f"{type(error).__name__}: {error}")
     except Exception:
-        # If notify fails we still want to keep running; the logger already
-        # captured the error.
         pass
+    await asyncio.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
+# 11. close_api
+# ---------------------------------------------------------------------------
+async def close_api() -> None:
+    """Close the Bybit client gracefully."""
+    global _client
+    if _client is not None:
+        try:
+            await _client.close()
+        finally:
+            _client = None

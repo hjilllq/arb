@@ -80,5 +80,54 @@ async def test_subscribe_to_websocket(monkeypatch):
     async def fast_sleep(_):
         pass
     monkeypatch.setattr(bybit_api.asyncio, "sleep", fast_sleep)
-    await bybit_api.subscribe_to_websocket("BTCUSDT", "spot")
+    await bybit_api.subscribe_to_websocket("BTCUSDT", "spot", max_messages=1)
     assert any("WS message" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_retry_logic(monkeypatch):
+    """Ensure retries happen and handle_api_error is invoked."""
+    class DummyClient:
+        def __init__(self):
+            self.calls = 0
+            self.tickers = {
+                "BTC/USDT": {"bid": 1, "ask": 2},
+                "BTCUSDT": {"bid": 3, "ask": 4},
+            }
+
+        async def fetch_ticker(self, symbol, params=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise bybit_api.ccxt.RequestTimeout("boom")
+            return self.tickers[symbol]
+
+    bybit_api._client = DummyClient()
+    monkeypatch.setattr(bybit_api.database, "save_data", lambda *a, **k: asyncio.sleep(0))
+    attempts: list[int] = []
+
+    async def fake_handle(exc, attempt=1):
+        attempts.append(attempt)
+
+    monkeypatch.setattr(bybit_api, "handle_api_error", fake_handle)
+    res = await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
+    assert res["spot"]["bid"] == 1
+    assert attempts == [1]
+
+
+@pytest.mark.asyncio
+async def test_retry_failure(monkeypatch):
+    """If all retries fail an empty dict is returned and handler called thrice."""
+    class DummyClient:
+        async def fetch_ticker(self, symbol, params=None):
+            raise bybit_api.ccxt.NetworkError("down")
+
+    bybit_api._client = DummyClient()
+    attempts: list[int] = []
+
+    async def fake_handle(exc, attempt=1):
+        attempts.append(attempt)
+
+    monkeypatch.setattr(bybit_api, "handle_api_error", fake_handle)
+    res = await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
+    assert res == {}
+    assert attempts == [1, 2, 3]
