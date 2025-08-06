@@ -269,6 +269,15 @@ def validate_config(config: Dict[str, Any]) -> bool:
             if max_mb <= 0:
                 raise ValueError("CACHE_MAX_MB must be positive")
             config["CACHE_MAX_MB"] = max_mb
+
+        # Optional retry delay settings for Bybit API helpers
+        if "API_RETRY_BASE_DELAY" in config or "API_RETRY_MAX_DELAY" in config:
+            base = float(config.get("API_RETRY_BASE_DELAY", 5))
+            mx = float(config.get("API_RETRY_MAX_DELAY", 60))
+            if base <= 0 or mx <= 0 or base > mx:
+                raise ValueError("API retry delays must be positive and base <= max")
+            config["API_RETRY_BASE_DELAY"] = base
+            config["API_RETRY_MAX_DELAY"] = mx
     except Exception as exc:  # broad to keep example child friendly
         logger.error("Validation failed: %s", exc)
         try:
@@ -485,7 +494,33 @@ def get_cache_max_bytes() -> int:
 
 
 # ---------------------------------------------------------------------------
-# 12. update_config
+# 12. get_retry_base_delay
+# ---------------------------------------------------------------------------
+def get_retry_base_delay() -> float:
+    """Return the base delay used for API retry backoff."""
+    cfg = load_config()
+    try:
+        base = float(cfg.get("API_RETRY_BASE_DELAY", 5.0))
+    except ValueError:
+        base = 5.0
+    return max(base, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 13. get_retry_max_delay
+# ---------------------------------------------------------------------------
+def get_retry_max_delay() -> float:
+    """Return the maximum delay between API retries."""
+    cfg = load_config()
+    try:
+        mx = float(cfg.get("API_RETRY_MAX_DELAY", 60.0))
+    except ValueError:
+        mx = 60.0
+    return max(mx, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 14. update_config
 # ---------------------------------------------------------------------------
 async def update_config(key: str, value: Any) -> None:
     """Asynchronously update a single configuration value.
@@ -537,7 +572,7 @@ async def update_config(key: str, value: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 13. backup_config
+# 15. backup_config
 # ---------------------------------------------------------------------------
 async def backup_config() -> None:
     """Create a timestamped copy of ``.env`` using a background thread.

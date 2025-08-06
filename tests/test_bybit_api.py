@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 import pytest
-import sys, pathlib, os, time, json
+import sys, pathlib, os, time, json, types
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 import bybit_api
@@ -408,6 +408,94 @@ async def test_monitor_cache_usage_warns(monkeypatch, tmp_path):
     monkeypatch.setattr(bybit_api.logger, "log_warning", fake_warn)
     await bybit_api.monitor_cache_usage()
     assert any("Cache usage" in m for m in warnings)
+
+
+@pytest.mark.asyncio
+async def test_monitor_cache_usage_notifies(monkeypatch, tmp_path):
+    monkeypatch.setattr(bybit_api, "_CACHE_DIR", tmp_path)
+    f = tmp_path / "a.json"
+    f.write_text("x" * 95)
+    monkeypatch.setattr(bybit_api.config, "get_cache_max_bytes", lambda: 100)
+    warnings: list[str] = []
+    async def fake_warn(msg):
+        warnings.append(msg)
+    monkeypatch.setattr(bybit_api.logger, "log_warning", fake_warn)
+    notified: list[str] = []
+    module = types.SimpleNamespace()
+    async def fake_notify(title, detail):
+        notified.append(detail)
+    module.notify = fake_notify
+    monkeypatch.setitem(sys.modules, "notification_manager", module)
+    await bybit_api.monitor_cache_usage()
+    assert warnings and notified
+
+
+@pytest.mark.asyncio
+async def test_handle_api_error_uses_config_delays(monkeypatch):
+    delays: list[float] = []
+    monkeypatch.setattr(bybit_api.config, "get_retry_base_delay", lambda: 1.0)
+    monkeypatch.setattr(bybit_api.config, "get_retry_max_delay", lambda: 5.0)
+    async def fake_sleep(d):
+        delays.append(d)
+    monkeypatch.setattr(bybit_api.asyncio, "sleep", fake_sleep)
+    async def fake_err(msg, err):
+        pass
+    monkeypatch.setattr(bybit_api.logger, "log_error", fake_err)
+    module = types.SimpleNamespace()
+    async def fake_notify(title, detail):
+        pass
+    module.notify = fake_notify
+    monkeypatch.setitem(sys.modules, "notification_manager", module)
+    await bybit_api.handle_api_error(Exception("boom"), attempt=2, context="x")
+    assert delays == [2.0]
+
+
+@pytest.mark.asyncio
+async def test_start_cache_monitor(monkeypatch):
+    calls: list[int] = []
+    async def fake_monitor():
+        calls.append(1)
+    monkeypatch.setattr(bybit_api, "monitor_cache_usage", fake_monitor)
+    bybit_api.start_cache_monitor(interval=0.01)
+    await asyncio.sleep(0.03)
+    await bybit_api.stop_cache_monitor()
+    assert len(calls) >= 2
+
+
+@pytest.mark.asyncio
+async def test_subscribe_to_websocket_many_messages(monkeypatch):
+    messages: list[str] = []
+    async def fake_log(msg):
+        messages.append(msg)
+    monkeypatch.setattr(bybit_api.logger, "log_info", fake_log)
+
+    class DummyWS:
+        def __init__(self):
+            self.count = 0
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+        async def send_str(self, msg):
+            pass
+        async def receive(self, timeout=None):
+            self.count += 1
+            return SimpleNamespace(type=bybit_api.aiohttp.WSMsgType.TEXT, data=f"m{self.count}")
+
+    class DummySession:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+        def ws_connect(self, url, heartbeat=20):
+            return DummyWS()
+
+    monkeypatch.setattr(bybit_api.aiohttp, "ClientSession", lambda: DummySession())
+    async def fast_sleep(_):
+        pass
+    monkeypatch.setattr(bybit_api.asyncio, "sleep", fast_sleep)
+    await bybit_api.subscribe_to_websocket("BTCUSDT", "spot", max_messages=5)
+    assert len([m for m in messages if "WS message" in m]) == 5
 
 
 @pytest.mark.asyncio

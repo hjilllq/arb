@@ -45,6 +45,9 @@ _CACHE_STATS = {
     "ticker_entries": 0,
 }
 
+# Background task that periodically checks cache usage.
+_cache_monitor_task: Optional[asyncio.Task] = None
+
 
 def get_cache_stats() -> Dict[str, int]:
     """Return current cache hit/miss counters."""
@@ -78,11 +81,44 @@ async def monitor_cache_usage() -> None:
         await logger.log_warning(
             f"Cache usage {size} bytes ({usage:.0%}) exceeds 90% of limit {limit}"
         )
+        try:  # notify operator when cache almost full
+            from notification_manager import notify  # type: ignore
+
+            detail = f"{size} bytes ({usage:.0%}) of {limit}"
+            await notify("Cache nearly full", detail)
+        except Exception:
+            pass
     else:
         await logger.log_info(
             f"Cache usage {size} bytes ({usage:.0%}) within limit {limit}"
         )
 
+
+async def _cache_monitor_loop(interval: float) -> None:
+    """Background task that periodically logs cache size."""
+    while True:  # pragma: no cover - loop control tested via start/stop
+        await monitor_cache_usage()
+        await asyncio.sleep(interval)
+
+
+def start_cache_monitor(interval: float = 300) -> None:
+    """Start a periodic cache monitor task."""
+    global _cache_monitor_task
+    if _cache_monitor_task is None or _cache_monitor_task.done():
+        loop = asyncio.get_running_loop()
+        _cache_monitor_task = loop.create_task(_cache_monitor_loop(interval))
+
+
+async def stop_cache_monitor() -> None:
+    """Stop the background cache monitor task."""
+    global _cache_monitor_task
+    if _cache_monitor_task is not None:
+        _cache_monitor_task.cancel()
+        try:
+            await _cache_monitor_task
+        except asyncio.CancelledError:  # pragma: no cover - expected cancel
+            pass
+        _cache_monitor_task = None
 
 async def _enforce_cache_limit() -> None:
     """Ensure the cache directory stays within the configured size limit."""
@@ -703,11 +739,17 @@ async def handle_api_error(
     if attempt > 1:
         message = f"{message} (attempt {attempt})"
     await logger.log_error(message, error)
-    delay = min(5 * 2 ** (attempt - 1), 60)
-    if isinstance(error, ccxt.RateLimitExceeded):
-        delay *= 2
-    elif isinstance(error, (ccxt.NetworkError, ccxt.RequestTimeout)):
-        delay += 5
+    base = config.get_retry_base_delay()
+    max_delay = config.get_retry_max_delay()
+    delay = base * 2 ** (attempt - 1)
+    try:
+        if isinstance(error, ccxt.RateLimitExceeded):
+            delay *= 2
+        elif isinstance(error, (ccxt.NetworkError, ccxt.RequestTimeout)):
+            delay += base
+    except AttributeError:  # ccxt stub may lack these classes during tests
+        pass
+    delay = min(delay, max_delay)
     try:
         from notification_manager import notify  # type: ignore
 

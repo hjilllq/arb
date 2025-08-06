@@ -128,3 +128,27 @@ def test_validate_config_cache_limit():
     bad = good.copy()
     bad['CACHE_MAX_MB'] = '0'
     assert not config.validate_config(bad)
+
+
+def test_retry_delay_helpers(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {
+        'API_RETRY_BASE_DELAY': '1.5',
+        'API_RETRY_MAX_DELAY': '9'
+    })
+    assert config.get_retry_base_delay() == 1.5
+    assert config.get_retry_max_delay() == 9.0
+
+
+def test_validate_retry_delays():
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'API_RETRY_BASE_DELAY': '1',
+        'API_RETRY_MAX_DELAY': '5'
+    }
+    assert config.validate_config(good)
+    bad = good.copy()
+    bad['API_RETRY_BASE_DELAY'] = '-1'
+    assert not config.validate_config(bad)
