@@ -298,6 +298,23 @@ def validate_config(config: Dict[str, Any]) -> bool:
             if timeout <= 0:
                 raise ValueError("SWITCH_BACKUP_TIMEOUT must be positive")
             config["SWITCH_BACKUP_TIMEOUT"] = timeout
+
+        # Optional request and retry settings for exchange_manager
+        if "REQUEST_RETRIES" in config:
+            retries = int(config["REQUEST_RETRIES"])
+            if retries <= 0:
+                raise ValueError("REQUEST_RETRIES must be positive")
+            config["REQUEST_RETRIES"] = retries
+        if "REQUEST_RETRY_DELAY" in config:
+            delay = float(config["REQUEST_RETRY_DELAY"])
+            if delay <= 0:
+                raise ValueError("REQUEST_RETRY_DELAY must be positive")
+            config["REQUEST_RETRY_DELAY"] = delay
+        if "EXCHANGE_REQUEST_LIMIT" in config:
+            limit = int(config["EXCHANGE_REQUEST_LIMIT"])
+            if limit <= 0:
+                raise ValueError("EXCHANGE_REQUEST_LIMIT must be positive")
+            config["EXCHANGE_REQUEST_LIMIT"] = limit
     except Exception as exc:  # broad to keep example child friendly
         logger.error("Validation failed: %s", exc)
         try:
@@ -613,6 +630,42 @@ def get_switch_backup_timeout() -> int:
     except ValueError:
         val = 300
     return max(val, 0)
+
+
+# ---------------------------------------------------------------------------
+# 13b. request/retry helpers
+# ---------------------------------------------------------------------------
+def get_request_retries() -> int:
+    """Return how many times API calls should be retried."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("REQUEST_RETRIES", 3))
+    except ValueError:
+        val = 3
+    return max(val, 0)
+
+
+def get_request_retry_delay() -> float:
+    """Return seconds to wait between retry attempts."""
+
+    cfg = load_config()
+    try:
+        val = float(cfg.get("REQUEST_RETRY_DELAY", 5.0))
+    except ValueError:
+        val = 5.0
+    return max(val, 0.0)
+
+
+def get_exchange_request_limit() -> int:
+    """Return the concurrent request cap per exchange."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("EXCHANGE_REQUEST_LIMIT", 5))
+    except ValueError:
+        val = 5
+    return max(val, 1)
 
 
 # ---------------------------------------------------------------------------

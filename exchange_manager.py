@@ -20,7 +20,14 @@ RateLimitExceeded = getattr(ccxt, "RateLimitExceeded", Exception)
 NetworkError = getattr(ccxt, "NetworkError", Exception)
 ExchangeError = getattr(ccxt, "ExchangeError", Exception)
 
-from config import CONFIG, get_pair_mapping, get_switch_backup_timeout
+from config import (
+    CONFIG,
+    get_exchange_request_limit,
+    get_pair_mapping,
+    get_request_retries,
+    get_request_retry_delay,
+    get_switch_backup_timeout,
+)
 from logger import get_logger
 
 try:  # pragma: no cover - notifier provided in real project
@@ -62,9 +69,9 @@ _FAIL_SWITCH = 3
 _SWITCH_TIMEOUT = get_switch_backup_timeout()
 
 # Retry and rate-limit settings for graceful recovery under load.
-_DEFAULT_RETRIES = int(CONFIG.get("REQUEST_RETRIES", 3))
-_RETRY_DELAY = float(CONFIG.get("REQUEST_RETRY_DELAY", 5))
-_REQUEST_LIMIT = int(CONFIG.get("EXCHANGE_REQUEST_LIMIT", 5))
+_DEFAULT_RETRIES = get_request_retries()
+_RETRY_DELAY = get_request_retry_delay()
+_REQUEST_LIMIT = get_exchange_request_limit()
 _RATE_LIMITERS: Dict[str, asyncio.Semaphore] = {}
 
 # Helper mapping from logical names to config keys for API credentials.
@@ -104,6 +111,31 @@ def _rate_limiter(name: str) -> asyncio.Semaphore:
         sem = asyncio.Semaphore(_REQUEST_LIMIT)
         _RATE_LIMITERS[name] = sem
     return sem
+
+
+async def monitor_rate_limits(threshold: float = 0.8) -> Dict[str, int]:
+    """Report remaining request slots and warn on heavy usage.
+
+    Parameters
+    ----------
+    threshold:
+        Fraction of the limit in use before a warning is emitted.
+
+    Returns
+    -------
+    dict
+        Mapping of exchange names to remaining slots.
+    """
+
+    status: Dict[str, int] = {}
+    for name, sem in _RATE_LIMITERS.items():
+        remaining = sem._value
+        status[name] = remaining
+        used = _REQUEST_LIMIT - remaining
+        if _REQUEST_LIMIT and used / _REQUEST_LIMIT >= threshold:
+            logger.warning("%s rate limit high: %d/%d", name, used, _REQUEST_LIMIT)
+            await notify("Rate limit high", f"{name}: {used}/{_REQUEST_LIMIT}")
+    return status
 
 
 async def _call_with_retries(

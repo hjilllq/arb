@@ -139,3 +139,23 @@ async def test_get_markets_retries(monkeypatch):
     markets = await em.get_markets("bybit", ttl=0)
     assert markets == {"BTC/USDT": {}}
     assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_monitor_rate_limits_warns(monkeypatch):
+    """monitor_rate_limits reports usage and triggers notification."""
+
+    notified = {}
+
+    async def fake_notify(msg, detail=""):
+        notified["msg"] = msg
+
+    monkeypatch.setattr(em, "notify", fake_notify)
+    em._REQUEST_LIMIT = 2
+    sem = em._rate_limiter("bybit")
+
+    async with sem:
+        status = await em.monitor_rate_limits(threshold=0.4)
+
+    assert status["bybit"] == 1
+    assert notified.get("msg") == "Rate limit high"

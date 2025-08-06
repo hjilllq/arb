@@ -223,3 +223,34 @@ def test_validate_switch_timeout():
     bad = good.copy()
     bad['SWITCH_BACKUP_TIMEOUT'] = '0'
     assert not config.validate_config(bad)
+
+
+def test_request_setting_helpers(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        'CONFIG',
+        {
+            'REQUEST_RETRIES': '4',
+            'REQUEST_RETRY_DELAY': '2.5',
+            'EXCHANGE_REQUEST_LIMIT': '7',
+        },
+    )
+    assert config.get_request_retries() == 4
+    assert config.get_request_retry_delay() == 2.5
+    assert config.get_exchange_request_limit() == 7
+
+
+def test_validate_request_settings():
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'REQUEST_RETRIES': '2',
+        'REQUEST_RETRY_DELAY': '5',
+        'EXCHANGE_REQUEST_LIMIT': '5',
+    }
+    assert config.validate_config(good)
+    bad = good.copy()
+    bad['REQUEST_RETRIES'] = '0'
+    assert not config.validate_config(bad)
