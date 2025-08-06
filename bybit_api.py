@@ -29,6 +29,16 @@ _CACHE_DIR.mkdir(exist_ok=True)
 _client: Optional[ccxt.bybit] = None
 
 
+def _normalize_futures_symbol(symbol: str) -> str:
+    """Return a Bybit-friendly futures symbol.
+
+    Bybit expects futures tickers without hyphenated suffixes, while config or
+    databases may store variants like ``"BTC-USDT"`` or ``"BTC-PERP"``.  This
+    helper trims those dashes so API calls work with both styles.
+    """
+    return symbol.replace("-", "")
+
+
 # ---------------------------------------------------------------------------
 # 1. connect_api
 # ---------------------------------------------------------------------------
@@ -114,13 +124,14 @@ async def get_historical_data(
     since = int(datetime.fromisoformat(start_date).timestamp() * 1000)
     until = int(datetime.fromisoformat(end_date).timestamp() * 1000)
     category = "spot" if contract_type == "spot" else "linear"
+    api_symbol = symbol if contract_type == "spot" else _normalize_futures_symbol(symbol)
 
     results: List[Dict[str, Any]] = []
     while since < until:
         for attempt in range(1, 4):
             try:
                 ohlcv = await _client.fetch_ohlcv(
-                    symbol,
+                    api_symbol,
                     timeframe,
                     since=since,
                     limit=200,
@@ -175,11 +186,13 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
     if mapping.get(spot_symbol) != futures_symbol:
         await logger.log_warning(f"Pair mapping mismatch for {spot_symbol}")
 
+    api_fut = _normalize_futures_symbol(futures_symbol)
+
     for attempt in range(1, 4):
         try:
             spot_ticker, fut_ticker = await asyncio.gather(
                 _client.fetch_ticker(spot_symbol, params={"category": "spot"}),
-                _client.fetch_ticker(futures_symbol, params={"category": "linear"}),
+                _client.fetch_ticker(api_fut, params={"category": "linear"}),
             )
             data = {
                 "spot": {"bid": spot_ticker.get("bid"), "ask": spot_ticker.get("ask")},
@@ -231,10 +244,11 @@ async def get_funding_rate_history(symbol: str, start_date: str, end_date: str) 
 
     since = int(datetime.fromisoformat(start_date).timestamp() * 1000)
     until = int(datetime.fromisoformat(end_date).timestamp() * 1000)
+    api_symbol = _normalize_futures_symbol(symbol)
     for attempt in range(1, 4):
         try:
             fr = await _client.fetch_funding_rate_history(
-                symbol, since=since, params={"until": until, "category": "linear"}
+                api_symbol, since=since, params={"until": until, "category": "linear"}
             )
             return [
                 {
@@ -269,7 +283,8 @@ async def subscribe_to_websocket(
         if contract_type == "spot"
         else "wss://stream.bybit.com/v5/public/linear"
     )
-    topic = f"tickers.{symbol}"
+    api_symbol = symbol if contract_type == "spot" else _normalize_futures_symbol(symbol)
+    topic = f"tickers.{api_symbol}"
     subscribe_msg = json.dumps({"op": "subscribe", "args": [topic]})
 
     while True:
@@ -298,7 +313,7 @@ async def place_order(
     symbol: str,
     side: str,
     amount: float,
-    price: float,
+    price: Optional[float],
     order_type: str = "limit",
     contract_type: str = "spot",
 ) -> Dict[str, Any]:
@@ -319,10 +334,13 @@ async def place_order(
         return {}
 
     category = "spot" if contract_type == "spot" else "linear"
+    api_symbol = symbol if contract_type == "spot" else _normalize_futures_symbol(symbol)
+    if order_type.lower() == "market":
+        price = None
     for attempt in range(1, 4):
         try:
             order = await _client.create_order(
-                symbol,
+                api_symbol,
                 order_type,
                 side,
                 amount,
@@ -341,7 +359,7 @@ async def place_order(
 # ---------------------------------------------------------------------------
 # 7. cancel_order
 # ---------------------------------------------------------------------------
-async def cancel_order(order_id: str, contract_type: str = "spot") -> bool:
+async def cancel_order(symbol: str, order_id: str, contract_type: str = "spot") -> bool:
     """Cancel an existing order.
 
     Parameters
@@ -359,9 +377,10 @@ async def cancel_order(order_id: str, contract_type: str = "spot") -> bool:
         return False
 
     category = "spot" if contract_type == "spot" else "linear"
+    api_symbol = symbol if contract_type == "spot" else _normalize_futures_symbol(symbol)
     for attempt in range(1, 4):
         try:
-            await _client.cancel_order(order_id, params={"category": category})
+            await _client.cancel_order(order_id, api_symbol, params={"category": category})
             await logger.log_info(f"Cancelled order {order_id}")
             return True
         except Exception as exc:

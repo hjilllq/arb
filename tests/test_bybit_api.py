@@ -13,6 +13,8 @@ class DummyClient:
             "BTC/USDT": {"bid": 1, "ask": 2},
             "BTCUSDT": {"bid": 3, "ask": 4},
         }
+        self.created = {}
+        self.cancel_symbol = None
 
     async def load_markets(self):
         self.load_markets_called = True
@@ -22,6 +24,14 @@ class DummyClient:
 
     async def fetch_balance(self):
         return {"total": {"USDT": 1000}}
+
+    async def create_order(self, symbol, order_type, side, amount, price, params=None):
+        self.created = {"symbol": symbol, "price": price}
+        return {"id": "1"}
+
+    async def cancel_order(self, order_id, symbol, params=None):
+        self.cancel_symbol = symbol
+        return {"id": order_id}
 
 @pytest.mark.asyncio
 async def test_connect_api(monkeypatch):
@@ -47,7 +57,7 @@ async def test_get_spot_futures_data(monkeypatch):
     async def fake_save(data):
         captured["rows"] = data
     monkeypatch.setattr(bybit_api.database, "save_data", fake_save)
-    res = await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
+    res = await bybit_api.get_spot_futures_data("BTC/USDT", "BTC-USDT")
     assert res["spot"]["bid"] == 1
     assert captured["rows"][0]["spot_symbol"] == "BTC/USDT"
 
@@ -131,3 +141,23 @@ async def test_retry_failure(monkeypatch):
     res = await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
     assert res == {}
     assert attempts == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_place_order_market_sets_price_none(monkeypatch):
+    client = DummyClient()
+    bybit_api._client = client
+    monkeypatch.setattr(bybit_api.logger, "log_info", lambda *a, **k: asyncio.sleep(0))
+    res = await bybit_api.place_order("BTCUSDT", "buy", 1, 100.0, order_type="market")
+    assert res["order_id"] == "1"
+    assert client.created["price"] is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_includes_symbol(monkeypatch):
+    client = DummyClient()
+    bybit_api._client = client
+    monkeypatch.setattr(bybit_api.logger, "log_info", lambda *a, **k: asyncio.sleep(0))
+    ok = await bybit_api.cancel_order("BTC-USDT", "42", "future")
+    assert ok
+    assert client.cancel_symbol == "BTCUSDT"
