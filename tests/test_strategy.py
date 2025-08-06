@@ -43,6 +43,35 @@ def test_apply_indicators_and_anomaly_detection():
         strategy.apply_indicators(bad)
 
 
+def test_apply_indicators_validates_columns_and_nans():
+    missing = pd.DataFrame({'spot_price': [100, 101]})
+    with pytest.raises(ValueError):
+        strategy.apply_indicators(missing)
+
+    nan_df = pd.DataFrame({'spot_price': [100, float('nan')], 'futures_price': [100, 101]})
+    with pytest.raises(ValueError):
+        strategy.apply_indicators(nan_df)
+
+
+def test_indicator_params_from_config(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        'CONFIG',
+        {
+            'RSI_PERIOD': '5',
+            'MACD_FAST': '3',
+            'MACD_SLOW': '6',
+            'MACD_SIGNAL': '4',
+            'MA_WINDOW': '3',
+            'BOLL_WINDOW': '3',
+        },
+    )
+    data = pd.DataFrame({'spot_price': [100, 101, 102, 103, 104],
+                         'futures_price': [100, 101, 102, 103, 104]})
+    indicators = strategy.apply_indicators(data)
+    assert {'rsi', 'macd', 'ma', 'bollinger'} <= indicators.keys()
+
+
 def test_manage_risk_limits_signal():
     config.CONFIG.update({
         'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.01',

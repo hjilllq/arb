@@ -284,6 +284,21 @@ def validate_config(config: Dict[str, Any]) -> bool:
                     raise ValueError(f"{key} must be positive")
                 config[key] = val
 
+        # Optional indicator parameters
+        for key in (
+            "RSI_PERIOD",
+            "MACD_FAST",
+            "MACD_SLOW",
+            "MACD_SIGNAL",
+            "MA_WINDOW",
+            "BOLL_WINDOW",
+        ):
+            if key in config:
+                val = int(config[key])
+                if val <= 0:
+                    raise ValueError(f"{key} must be positive")
+                config[key] = val
+
         # Optional retry delay settings for Bybit API helpers
         if "API_RETRY_BASE_DELAY" in config or "API_RETRY_MAX_DELAY" in config:
             base = float(config.get("API_RETRY_BASE_DELAY", 5))
@@ -550,7 +565,65 @@ def get_max_basis_risk() -> float:
 
 
 # ---------------------------------------------------------------------------
-# 11. get_cache_max_bytes
+# 11a. Indicator parameter helpers
+# ---------------------------------------------------------------------------
+def get_rsi_period() -> int:
+    """Return the window size for RSI calculations.
+
+    The default of ``14`` matches common trading literature.  Values are
+    coerced to at least ``1`` so callers never receive a nonsense period.
+    """
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("RSI_PERIOD", 14))
+    except ValueError:
+        val = 14
+    return max(val, 1)
+
+
+def get_macd_periods() -> tuple[int, int, int]:
+    """Return ``(fast, slow, signal)`` periods for MACD calculations."""
+
+    cfg = load_config()
+
+    def _get(name: str, default: int) -> int:
+        try:
+            val = int(cfg.get(name, default))
+        except ValueError:
+            val = default
+        return max(val, 1)
+
+    fast = _get("MACD_FAST", 12)
+    slow = _get("MACD_SLOW", 26)
+    signal = _get("MACD_SIGNAL", 9)
+    return fast, slow, signal
+
+
+def get_ma_window() -> int:
+    """Return the window size for moving average indicators."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("MA_WINDOW", 5))
+    except ValueError:
+        val = 5
+    return max(val, 1)
+
+
+def get_boll_window() -> int:
+    """Return the window size for Bollinger bands."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("BOLL_WINDOW", 5))
+    except ValueError:
+        val = 5
+    return max(val, 1)
+
+
+# ---------------------------------------------------------------------------
+# 11b. get_cache_max_bytes
 # ---------------------------------------------------------------------------
 def get_cache_max_bytes() -> int:
     """Return the maximum cache directory size in bytes.
@@ -570,7 +643,7 @@ def get_cache_max_bytes() -> int:
 
 
 # ---------------------------------------------------------------------------
-# 11a. get_memory_max_bytes
+# 11c. get_memory_max_bytes
 # ---------------------------------------------------------------------------
 def get_memory_max_bytes() -> int:
     """Return the memory usage limit in bytes.
@@ -590,7 +663,7 @@ def get_memory_max_bytes() -> int:
 
 
 # ---------------------------------------------------------------------------
-# 11b. get_cache_notify_channels
+# 11d. get_cache_notify_channels
 # ---------------------------------------------------------------------------
 def get_cache_notify_channels() -> str:
     """Return comma-separated channels for cache alerts."""

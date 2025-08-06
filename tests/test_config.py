@@ -182,6 +182,25 @@ def test_validate_slippage_positive():
     assert not config.validate_config(bad)
 
 
+def test_indicator_param_helpers(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        'CONFIG',
+        {
+            'RSI_PERIOD': '21',
+            'MACD_FAST': '8',
+            'MACD_SLOW': '17',
+            'MACD_SIGNAL': '5',
+            'MA_WINDOW': '20',
+            'BOLL_WINDOW': '18',
+        },
+    )
+    assert config.get_rsi_period() == 21
+    assert config.get_macd_periods() == (8, 17, 5)
+    assert config.get_ma_window() == 20
+    assert config.get_boll_window() == 18
+
+
 def test_retry_delay_helpers(monkeypatch):
     monkeypatch.setattr(config, 'CONFIG', {
         'API_RETRY_BASE_DELAY': '1.5',
@@ -203,6 +222,20 @@ def test_validate_retry_delays():
     assert config.validate_config(good)
     bad = good.copy()
     bad['API_RETRY_BASE_DELAY'] = '-1'
+    assert not config.validate_config(bad)
+
+
+def test_validate_indicator_params():
+    base = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'RSI_PERIOD': '14'
+    }
+    assert config.validate_config(base)
+    bad = base.copy()
+    bad['MACD_FAST'] = '0'
     assert not config.validate_config(bad)
 
 

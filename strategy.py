@@ -21,6 +21,10 @@ from config import (
     get_spot_slippage,
     get_futures_slippage,
     get_max_basis_risk,
+    get_rsi_period,
+    get_macd_periods,
+    get_ma_window,
+    get_boll_window,
 )
 from logger import log_error, log_info
 
@@ -109,8 +113,9 @@ def generate_basis_signal(
 def apply_indicators(data: pd.DataFrame) -> Dict[str, float]:
     """Calculate RSI, MACD, moving average and Bollinger band on ``data``.
 
-    The function also checks for price anomalies (>10% jump) and logs them with
-    helpful context.
+    Indicator periods are pulled from :mod:`config` so that operators can tweak
+    sensitivity at runtime. The function also checks for price anomalies
+    (>10% jump) and logs them with helpful context.
 
     Parameters
     ----------
@@ -128,8 +133,42 @@ def apply_indicators(data: pd.DataFrame) -> Dict[str, float]:
     ValueError
         If a price jump greater than 10% is detected between consecutive rows.
     """
+
     if data.empty:
         raise ValueError("DataFrame is empty")
+
+    required = {"spot_price", "futures_price"}
+    if not required.issubset(data.columns):
+        missing = required - set(data.columns)
+        msg = f"Missing columns: {', '.join(missing)}"
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(log_error(msg, ValueError()))
+            loop.create_task(notify("Indicator data error", msg))
+        except RuntimeError:
+            pass
+        raise ValueError(msg)
+
+    cols = list(required)
+    if data[cols].isnull().any().any():
+        msg = "Data contains NaN values"
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(log_error(msg, ValueError()))
+            loop.create_task(notify("Indicator data error", msg))
+        except RuntimeError:
+            pass
+        raise ValueError(msg)
+
+    if (data[cols] <= 0).any().any():
+        msg = "Prices must be positive"
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(log_error(msg, ValueError()))
+            loop.create_task(notify("Indicator data error", msg))
+        except RuntimeError:
+            pass
+        raise ValueError(msg)
 
     # Detect anomalous jumps
     spot_jumps = data["spot_price"].pct_change().abs().dropna()
@@ -156,23 +195,51 @@ def apply_indicators(data: pd.DataFrame) -> Dict[str, float]:
             pass
         raise ValueError("Price jump >10% detected")
 
+    rsi_period = get_rsi_period()
+    macd_fast, macd_slow, macd_signal = get_macd_periods()
+    ma_window = get_ma_window()
+    boll_window = get_boll_window()
+
     # Compute indicators concurrently to utilise multiple cores
     rsi_future = _EXECUTOR.submit(
-        lambda s=data["spot_price"]: RSIIndicator(s).rsi().iloc[-1]
+        lambda s=data["spot_price"]: RSIIndicator(s, window=rsi_period)
+        .rsi()
+        .iloc[-1]
     )
     macd_future = _EXECUTOR.submit(
-        lambda s=data["spot_price"]: MACD(s).macd().iloc[-1]
+        lambda s=data["spot_price"]: MACD(
+            s,
+            window_slow=macd_slow,
+            window_fast=macd_fast,
+            window_sign=macd_signal,
+        ).macd().iloc[-1]
     )
     ma_future = _EXECUTOR.submit(
-        lambda s=data["spot_price"]: SMAIndicator(s, window=5).sma_indicator().iloc[-1]
+        lambda s=data["spot_price"]: SMAIndicator(s, window=ma_window)
+        .sma_indicator()
+        .iloc[-1]
     )
     boll_future = _EXECUTOR.submit(
-        lambda s=data["spot_price"]: BollingerBands(s, window=5).bollinger_hband().iloc[-1]
+        lambda s=data["spot_price"]: BollingerBands(s, window=boll_window)
+        .bollinger_hband()
+        .iloc[-1]
     )
-    rsi = rsi_future.result()
-    macd_value = macd_future.result()
-    ma_value = ma_future.result()
-    boll_value = boll_future.result()
+
+    try:
+        rsi = rsi_future.result()
+        macd_value = macd_future.result()
+        ma_value = ma_future.result()
+        boll_value = boll_future.result()
+    except Exception as exc:
+        msg = f"Indicator calculation failed: {exc}"
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(log_error(msg, exc))
+            loop.create_task(notify("Indicator calc error", msg))
+        except RuntimeError:
+            pass
+        raise
+
     return {
         "rsi": float(rsi),
         "macd": float(macd_value),
