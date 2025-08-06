@@ -340,6 +340,7 @@ async def add_exchange(exchange_name: str, api_key: str, api_secret: str) -> Non
         key_field, secret_field = _KEY_MAP.get(name, ("", ""))
         api_key = api_key or CONFIG.get(key_field, "")
         api_secret = api_secret or CONFIG.get(secret_field, "")
+    logger.debug("Creating client for %s", name)
     try:
         exchange_cls = getattr(ccxt, name)
         client = exchange_cls(
@@ -357,7 +358,7 @@ async def add_exchange(exchange_name: str, api_key: str, api_secret: str) -> Non
         global _active_exchange
         if _active_exchange is None:
             _active_exchange = name
-        logger.info("Exchange %s added", name)
+        logger.info("Exchange %s added (limit=%d)", name, _REQUEST_LIMIT)
     except Exception as exc:  # pragma: no cover - depends on ccxt internals
         logger.error("Failed to add exchange %s: %s", name, exc)
         await notify("Exchange add failed", f"{name}: {exc}")
@@ -377,14 +378,18 @@ async def switch_to_backup_exchange() -> bool:
     global _active_exchange, _NEXT_RECONNECT
     candidates = [c for c in _get_backup_candidates() if c != _active_exchange]
     if not candidates:
+        logger.error("No backup exchanges available for failover")
         return False
 
+    logger.info("Probing backup exchanges: %s", candidates)
     probes = {name: asyncio.create_task(_probe_exchange(name)) for name in candidates}
     results = await asyncio.gather(*probes.values())
     latencies = {name: lat for name, lat in zip(probes.keys(), results) if lat is not None}
     if not latencies:
+        logger.error("All backup exchanges unreachable: %s", candidates)
         return False
 
+    logger.info("Backup probe latencies: %s", latencies)
     best = min(latencies, key=latencies.get)
     old = _active_exchange
     _active_exchange = best
@@ -413,6 +418,7 @@ async def _maybe_reconnect_primary() -> bool:
     if now < _NEXT_RECONNECT:
         return False
 
+    logger.info("Attempting to reconnect to primary %s", _PRIMARY)
     latency = await _probe_exchange(_PRIMARY)
     if latency is not None:
         old = _active_exchange
@@ -531,6 +537,7 @@ async def sync_trading_pairs(exchanges: List[str]) -> Dict[str, str]:
     {'BTC/USDT': 'BTCUSDT'}
     """
 
+    logger.info("Syncing trading pairs across %s", exchanges)
     mapping = get_pair_mapping()
     if not mapping:
         logger.error("No pair mapping defined in configuration")
@@ -646,7 +653,7 @@ async def check_exchange_health(exchange_name: str) -> bool:
             _OUTAGE_REPORTED.discard(name)
         if _PROM_HEALTH:
             _PROM_HEALTH.labels(name).set(now)
-        logger.debug("Exchange %s healthy", name)
+        logger.info("Exchange %s healthy (%.3fs)", name, latency)
         await _fire_health_event(name, True)
         if name == _active_exchange and _active_exchange != _PRIMARY:
             await _maybe_reconnect_primary()
@@ -655,8 +662,14 @@ async def check_exchange_health(exchange_name: str) -> bool:
     failures = _FAIL_COUNTS.get(name, 0) + 1
     _FAIL_COUNTS[name] = failures
     last = _last_health.get(name, 0)
+    downtime = now - last
     logger.warning(
-        "Health check %s error for %s (failure %d): %s", err_kind, name, failures, err
+        "Health check %s error for %s (failure %d, downtime %.1fs): %s",
+        err_kind,
+        name,
+        failures,
+        downtime,
+        err,
     )
     await notify("Exchange health failed", f"{name} ({err_kind}): {err}")
     if failures >= _MAX_FAILURES:
