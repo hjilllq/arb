@@ -356,6 +356,82 @@ async def test_ticker_cache_respects_ttl(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cache_stats_tracking(monkeypatch, tmp_path):
+    """Hits and misses should be counted for monitoring."""
+
+    class DummyClient:
+        def __init__(self):
+            self.fetch_ohlcv_calls = 0
+            self.fetch_ticker_calls = 0
+
+        async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
+            self.fetch_ohlcv_calls += 1
+            return [[since or 0, 1, 1, 1, 1, 1]]
+
+        async def fetch_ticker(self, symbol, params=None):
+            self.fetch_ticker_calls += 1
+            return {"bid": 1, "ask": 2}
+
+    bybit_api._client = DummyClient()
+    monkeypatch.setattr(bybit_api, "_CACHE_DIR", tmp_path)
+    bybit_api._TICKER_CACHE.clear()
+    bybit_api._CACHE_STATS.update(
+        disk_hits=0, disk_misses=0, ticker_hits=0, ticker_misses=0
+    )
+    monkeypatch.setattr(bybit_api.database, "save_data", lambda *a, **k: asyncio.sleep(0))
+    monkeypatch.setattr(bybit_api.config, "get_cache_ttl", lambda: 3600)
+    monkeypatch.setattr(bybit_api.config, "get_ticker_cache_ttl", lambda: 3600)
+
+    await bybit_api.get_historical_data("BTC/USDT", "1m", "2024-01-01", "2024-01-02")
+    await bybit_api.get_historical_data("BTC/USDT", "1m", "2024-01-01", "2024-01-02")
+    await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
+    await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
+
+    stats = bybit_api.get_cache_stats()
+    assert stats["disk_misses"] == 1
+    assert stats["disk_hits"] == 1
+    assert stats["ticker_misses"] == 1
+    assert stats["ticker_hits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_monitor_cache_usage_warns(monkeypatch, tmp_path):
+    monkeypatch.setattr(bybit_api, "_CACHE_DIR", tmp_path)
+    f = tmp_path / "a.json"
+    f.write_text("x" * 95)
+    monkeypatch.setattr(bybit_api.config, "get_cache_max_bytes", lambda: 100)
+    warnings: list[str] = []
+
+    async def fake_warn(msg):
+        warnings.append(msg)
+
+    monkeypatch.setattr(bybit_api.logger, "log_warning", fake_warn)
+    await bybit_api.monitor_cache_usage()
+    assert any("Cache usage" in m for m in warnings)
+
+
+@pytest.mark.asyncio
+async def test_multiple_tickers_stress(monkeypatch):
+    class DummyClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_ticker(self, symbol, params=None):
+            self.calls += 1
+            await asyncio.sleep(0.01)
+            return {"bid": 1, "ask": 2}
+
+    bybit_api._client = DummyClient()
+    symbols = [f"SYM{i}/USDT" for i in range(20)]
+    start = time.perf_counter()
+    res = await bybit_api.get_multiple_tickers(symbols)
+    elapsed = time.perf_counter() - start
+    assert len(res) == 20
+    assert bybit_api._client.calls == 20
+    assert elapsed < 0.15  # concurrent gather should be fast
+
+
+@pytest.mark.asyncio
 async def test_ticker_cache_disabled_with_zero_ttl(monkeypatch):
     """A zero TTL disables ticker caching entirely."""
 

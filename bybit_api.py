@@ -32,6 +32,54 @@ _client: Optional[ccxt.bybit] = None
 # In-memory cache for recent tickers to avoid hammering the API.
 _TICKER_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
 
+# Simple counters to monitor cache effectiveness.  They help us observe
+# whether we are mostly hitting cached values or still calling the exchange
+# too often.  The numbers are exposed via :func:`get_cache_stats` and can be
+# scraped by external metrics systems.
+_CACHE_STATS = {
+    "disk_hits": 0,
+    "disk_misses": 0,
+    "ticker_hits": 0,
+    "ticker_misses": 0,
+}
+
+
+def get_cache_stats() -> Dict[str, int]:
+    """Return current cache hit/miss counters."""
+
+    return dict(_CACHE_STATS)
+
+
+async def monitor_cache_usage() -> None:
+    """Log how much space the cache directory consumes.
+
+    When the cache grows beyond 90% of its configured limit a warning is
+    emitted so operators can investigate or increase the allowance.
+    """
+
+    limit = config.get_cache_max_bytes()
+    if limit <= 0:
+        return
+
+    def _size() -> int:
+        return sum(p.stat().st_size for p in _CACHE_DIR.glob("*"))
+
+    try:
+        size = await asyncio.to_thread(_size)
+    except Exception as exc:  # pragma: no cover - unexpected FS failure
+        await handle_api_error(exc, context="cache_size")
+        return
+
+    usage = size / limit
+    if usage >= 0.9:
+        await logger.log_warning(
+            f"Cache usage {size} bytes ({usage:.0%}) exceeds 90% of limit {limit}"
+        )
+    else:
+        await logger.log_info(
+            f"Cache usage {size} bytes ({usage:.0%}) within limit {limit}"
+        )
+
 
 async def _enforce_cache_limit() -> None:
     """Ensure the cache directory stays within the configured size limit."""
@@ -60,6 +108,7 @@ async def _enforce_cache_limit() -> None:
             await logger.log_info(f"Cache trimmed: {name}")
     except Exception as exc:
         await handle_api_error(exc, context="cache_prune")
+    await monitor_cache_usage()
 
 
 def _normalize_futures_symbol(symbol: str) -> str:
@@ -182,6 +231,7 @@ async def get_historical_data(
                 text = await asyncio.to_thread(cache_file.read_text)
                 cached = json.loads(text)
                 if isinstance(cached, list):
+                    _CACHE_STATS["disk_hits"] += 1
                     return cached
                 await logger.log_warning(f"Cache format invalid: {cache_file}")
             else:
@@ -238,6 +288,8 @@ async def get_historical_data(
             await _enforce_cache_limit()
         except Exception as exc:
             await handle_api_error(exc, context=f"cache_write ohlcv {cache_file}")
+        finally:
+            _CACHE_STATS["disk_misses"] += 1
     return results
 
 
@@ -271,8 +323,10 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
     cached = _TICKER_CACHE.get(key)
     ttl = config.get_ticker_cache_ttl()
     if cached and now - cached[0] < ttl:
+        _CACHE_STATS["ticker_hits"] += 1
         return cached[1]
 
+    _CACHE_STATS["ticker_misses"] += 1
     for attempt in range(1, 4):
         try:
             spot_ticker, fut_ticker = await asyncio.gather(
@@ -376,6 +430,7 @@ async def get_funding_rate_history(symbol: str, start_date: str, end_date: str) 
                 text = await asyncio.to_thread(cache_file.read_text)
                 cached = json.loads(text)
                 if isinstance(cached, list):
+                    _CACHE_STATS["disk_hits"] += 1
                     return cached
                 await logger.log_warning(f"Cache format invalid: {cache_file}")
             else:
@@ -407,6 +462,8 @@ async def get_funding_rate_history(symbol: str, start_date: str, end_date: str) 
                 await _enforce_cache_limit()
             except Exception as exc:
                 await handle_api_error(exc, context=f"cache_write funding {cache_file}")
+            finally:
+                _CACHE_STATS["disk_misses"] += 1
             return data
         except Exception as exc:
             await handle_api_error(exc, attempt, context=f"funding {symbol}")
