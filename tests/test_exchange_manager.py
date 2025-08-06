@@ -29,6 +29,7 @@ class DummyClient:
 
 @pytest.fixture(autouse=True)
 def reset_state():
+    original_config = dict(em.CONFIG)
     em._EXCHANGES.clear()
     em._active_exchange = None
     em._last_health.clear()
@@ -37,10 +38,13 @@ def reset_state():
     em._PAIR_TTLS.clear()
     em._RATE_LIMITERS.clear()
     em._HEALTH_LISTENERS.clear()
+    em._FAIL_COUNTS.clear()
     em._RETRY_DELAY = 0
     em._DEFAULT_RETRIES = 1
     yield
     em._EXCHANGES.clear()
+    em.CONFIG.clear()
+    em.CONFIG.update(original_config)
 
 
 @pytest.mark.asyncio
@@ -267,3 +271,49 @@ async def test_get_markets_invalid_payload(monkeypatch):
 
     with pytest.raises(em.ExchangeError):
         await em.get_markets("bybit", ttl=0)
+
+
+@pytest.mark.asyncio
+async def test_health_failures_reset_after_success(monkeypatch):
+    """Consecutive failure counts drop back to zero on recovery."""
+
+    class Flaky(DummyClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def fetch_time(self):  # type: ignore[override]
+            self.calls += 1
+            if self.calls <= 2:
+                raise ccxt.NetworkError("offline")
+            return int(time.time() * 1000)
+
+    monkeypatch.setattr(ccxt, "bybit", lambda config=None: Flaky())
+
+    await em.add_exchange("bybit", "k", "s")
+    em._last_health["bybit"] = time.time()
+
+    await em.check_exchange_health("bybit")  # failure 1
+    await em.check_exchange_health("bybit")  # failure 2
+    assert em._FAIL_COUNTS["bybit"] == 2
+
+    await em.check_exchange_health("bybit")  # success
+    assert em._FAIL_COUNTS.get("bybit", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_enforces_limit(monkeypatch):
+    """Semaphore ensures requests run sequentially when limit is 1."""
+
+    em._REQUEST_LIMIT = 1
+    sem = em._rate_limiter("bybit")
+
+    timestamps: list[float] = []
+
+    async def worker():
+        async with sem:
+            timestamps.append(time.perf_counter())
+            await asyncio.sleep(0.05)
+
+    await asyncio.gather(worker(), worker())
+    assert timestamps[1] - timestamps[0] >= 0.05
