@@ -102,3 +102,9 @@ def test_backup_cleanup(tmp_path, monkeypatch):
     asyncio.run(config.backup_config())
     backups = list(backup_dir.glob('*.bak'))
     assert len(backups) <= 1
+
+
+def test_cache_ttl_helpers(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {'CACHE_TTL_SECONDS': '42', 'TICKER_CACHE_TTL_SECONDS': '2.5'})
+    assert config.get_cache_ttl() == 42
+    assert config.get_ticker_cache_ttl() == 2.5

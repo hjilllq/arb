@@ -145,12 +145,22 @@ async def get_historical_data(
     # Check cache before requesting the API to reduce load.
     cache_name = f"ohlcv_{api_symbol.replace('/', '')}_{timeframe}_{start_date}_{end_date}.json"
     cache_file = _CACHE_DIR / cache_name
+    ttl = config.get_cache_ttl()
     if cache_file.exists():
         try:
-            text = await asyncio.to_thread(cache_file.read_text)
-            return json.loads(text)
-        except Exception:
-            pass
+            if ttl > 0 and time.time() - cache_file.stat().st_mtime <= ttl:
+                text = await asyncio.to_thread(cache_file.read_text)
+                cached = json.loads(text)
+                if isinstance(cached, list):
+                    return cached
+                await logger.log_warning(f"Cache format invalid: {cache_file}")
+            else:
+                await asyncio.to_thread(cache_file.unlink)
+        except json.JSONDecodeError as exc:
+            await logger.log_warning(f"Cache corrupted {cache_file}: {exc}")
+            await asyncio.to_thread(cache_file.unlink)
+        except Exception as exc:
+            await handle_api_error(exc, context="cache_read ohlcv")
 
     results: List[Dict[str, Any]] = []
     while since < until:
@@ -224,7 +234,8 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
     key = (spot_symbol, futures_symbol)
     now = time.monotonic()
     cached = _TICKER_CACHE.get(key)
-    if cached and now - cached[0] < 1:
+    ttl = config.get_ticker_cache_ttl()
+    if cached and now - cached[0] < ttl:
         return cached[1]
 
     for attempt in range(1, 4):
@@ -290,12 +301,22 @@ async def get_funding_rate_history(symbol: str, start_date: str, end_date: str) 
 
     cache_name = f"funding_{api_symbol}_{start_date}_{end_date}.json"
     cache_file = _CACHE_DIR / cache_name
+    ttl = config.get_cache_ttl()
     if cache_file.exists():
         try:
-            text = await asyncio.to_thread(cache_file.read_text)
-            return json.loads(text)
-        except Exception:
-            pass
+            if ttl > 0 and time.time() - cache_file.stat().st_mtime <= ttl:
+                text = await asyncio.to_thread(cache_file.read_text)
+                cached = json.loads(text)
+                if isinstance(cached, list):
+                    return cached
+                await logger.log_warning(f"Cache format invalid: {cache_file}")
+            else:
+                await asyncio.to_thread(cache_file.unlink)
+        except json.JSONDecodeError as exc:
+            await logger.log_warning(f"Cache corrupted {cache_file}: {exc}")
+            await asyncio.to_thread(cache_file.unlink)
+        except Exception as exc:
+            await handle_api_error(exc, context="cache_read funding")
 
     for attempt in range(1, 4):
         try:

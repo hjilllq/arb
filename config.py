@@ -251,6 +251,18 @@ def validate_config(config: Dict[str, Any]) -> bool:
         config["PAIR_TTL_MIN"] = ttl_min
         config["PAIR_TTL_MAX"] = ttl_max
         config["PAIR_TTL_STEP"] = ttl_step
+
+        # Optional cache TTLs for Bybit API helpers
+        if "CACHE_TTL_SECONDS" in config:
+            ttl = int(config["CACHE_TTL_SECONDS"])
+            if ttl <= 0:
+                raise ValueError("CACHE_TTL_SECONDS must be positive")
+            config["CACHE_TTL_SECONDS"] = ttl
+        if "TICKER_CACHE_TTL_SECONDS" in config:
+            tttl = float(config["TICKER_CACHE_TTL_SECONDS"])
+            if tttl <= 0:
+                raise ValueError("TICKER_CACHE_TTL_SECONDS must be positive")
+            config["TICKER_CACHE_TTL_SECONDS"] = tttl
     except Exception as exc:  # broad to keep example child friendly
         logger.error("Validation failed: %s", exc)
         try:
@@ -375,7 +387,7 @@ def get_pair_mapping() -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# 8. get_pair_thresholds                                                     
+# 8. get_pair_thresholds
 # ---------------------------------------------------------------------------
 def get_pair_thresholds(symbol: str) -> Dict[str, float]:
     """Fetch open/close basis thresholds for a given spot pair.
@@ -414,7 +426,40 @@ def get_pair_thresholds(symbol: str) -> Dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# 9. update_config                                                           
+# 9. get_cache_ttl
+# ---------------------------------------------------------------------------
+def get_cache_ttl() -> int:
+    """Return how long, in seconds, disk cache files remain fresh.
+
+    Example
+    -------
+    >>> CONFIG['CACHE_TTL_SECONDS'] = '60'
+    >>> get_cache_ttl()
+    60
+    """
+    cfg = load_config()
+    try:
+        ttl = int(cfg.get("CACHE_TTL_SECONDS", 86_400))
+    except ValueError:
+        ttl = 86_400
+    return max(ttl, 0)
+
+
+# ---------------------------------------------------------------------------
+# 10. get_ticker_cache_ttl
+# ---------------------------------------------------------------------------
+def get_ticker_cache_ttl() -> float:
+    """Return how long the in-memory ticker cache stays valid."""
+    cfg = load_config()
+    try:
+        ttl = float(cfg.get("TICKER_CACHE_TTL_SECONDS", 1.0))
+    except ValueError:
+        ttl = 1.0
+    return max(ttl, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 11. update_config
 # ---------------------------------------------------------------------------
 async def update_config(key: str, value: Any) -> None:
     """Asynchronously update a single configuration value.
@@ -466,7 +511,7 @@ async def update_config(key: str, value: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. backup_config                                                          
+# 12. backup_config
 # ---------------------------------------------------------------------------
 async def backup_config() -> None:
     """Create a timestamped copy of ``.env`` using a background thread.

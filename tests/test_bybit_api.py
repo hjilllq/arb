@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 import pytest
-import sys, pathlib
+import sys, pathlib, os, time, json
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 import bybit_api
@@ -221,3 +221,55 @@ async def test_historical_data_cache(monkeypatch, tmp_path):
     )
     assert bybit_api._client.calls == first_calls
     assert data1 == data2
+
+
+@pytest.mark.asyncio
+async def test_historical_cache_expiry(monkeypatch, tmp_path):
+    monkeypatch.setattr(bybit_api, "_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(bybit_api.config, "get_cache_ttl", lambda: 1)
+
+    cache_file = tmp_path / "ohlcv_BTCUSDT_1m_2024-01-01_2024-01-02.json"
+    cache_file.write_text("[]")
+    os.utime(cache_file, (time.time() - 10, time.time() - 10))
+
+    class DummyClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
+            self.calls += 1
+            return [[since, 1, 1, 1, 1, 1]] if self.calls == 1 else []
+
+    bybit_api._client = DummyClient()
+    await bybit_api.get_historical_data("BTC/USDT", "1m", "2024-01-01", "2024-01-02")
+    first = bybit_api._client.calls
+    # second call should hit fresh cache without increasing calls
+    await bybit_api.get_historical_data("BTC/USDT", "1m", "2024-01-01", "2024-01-02")
+    assert bybit_api._client.calls == first
+
+
+@pytest.mark.asyncio
+async def test_historical_cache_corrupted(monkeypatch, tmp_path):
+    monkeypatch.setattr(bybit_api, "_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(bybit_api.config, "get_cache_ttl", lambda: 3600)
+    monkeypatch.setattr(bybit_api.logger, "log_warning", lambda *a, **k: asyncio.sleep(0))
+
+    cache_file = tmp_path / "ohlcv_BTCUSDT_1m_2024-01-01_2024-01-02.json"
+    cache_file.write_text("{bad json")
+
+    class DummyClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
+            self.calls += 1
+            return [[since, 1, 1, 1, 1, 1]] if self.calls == 1 else []
+
+    bybit_api._client = DummyClient()
+    await bybit_api.get_historical_data("BTC/USDT", "1m", "2024-01-01", "2024-01-02")
+    first = bybit_api._client.calls
+    await bybit_api.get_historical_data("BTC/USDT", "1m", "2024-01-01", "2024-01-02")
+    assert bybit_api._client.calls == first
+    # cache file replaced with valid JSON
+    parsed = json.loads(cache_file.read_text())
+    assert parsed[0]["open"] == 1
