@@ -33,6 +33,35 @@ _client: Optional[ccxt.bybit] = None
 _TICKER_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
 
 
+async def _enforce_cache_limit() -> None:
+    """Ensure the cache directory stays within the configured size limit."""
+    limit = config.get_cache_max_bytes()
+    if limit <= 0:
+        return
+
+    def _prune() -> List[str]:
+        files = sorted(_CACHE_DIR.glob("*"), key=lambda p: p.stat().st_mtime)
+        size = sum(p.stat().st_size for p in files)
+        removed: List[str] = []
+        while size > limit and files:
+            victim = files.pop(0)
+            try:
+                victim_size = victim.stat().st_size
+                victim.unlink()
+                removed.append(victim.name)
+                size -= victim_size
+            except OSError:
+                break
+        return removed
+
+    try:
+        removed = await asyncio.to_thread(_prune)
+        for name in removed:
+            await logger.log_info(f"Cache trimmed: {name}")
+    except Exception as exc:
+        await handle_api_error(exc, context="cache_prune")
+
+
 def _normalize_futures_symbol(symbol: str) -> str:
     """Return a Bybit-friendly futures symbol.
 
@@ -86,8 +115,9 @@ async def connect_api(
         # readily available for later calls without extra disk I/O.
         config.get_spot_pairs()
         config.get_futures_pairs()
-        config.get_pair_mapping()
+        mapping = config.get_pair_mapping()
         await logger.log_info("Connected to Bybit API")
+        await logger.log_info(f"Pair mapping warmed with {len(mapping)} items")
     except Exception as exc:
         # Close the client on failure to avoid dangling connections.
         try:
@@ -156,9 +186,11 @@ async def get_historical_data(
                 await logger.log_warning(f"Cache format invalid: {cache_file}")
             else:
                 await asyncio.to_thread(cache_file.unlink)
+                await logger.log_info(f"Cache expired: {cache_file}")
         except json.JSONDecodeError as exc:
             await logger.log_warning(f"Cache corrupted {cache_file}: {exc}")
             await asyncio.to_thread(cache_file.unlink)
+            await logger.log_info(f"Corrupt cache removed: {cache_file}")
         except Exception as exc:
             await handle_api_error(exc, context="cache_read ohlcv")
 
@@ -199,10 +231,13 @@ async def get_historical_data(
     if not results:
         await logger.log_warning(f"No historical data for {symbol}")
     else:
+        await logger.log_info(f"Fetched {len(results)} candles for {symbol}")
         try:
             await asyncio.to_thread(cache_file.write_text, json.dumps(results))
+            await logger.log_info(f"Cached OHLCV to {cache_file}")
+            await _enforce_cache_limit()
         except Exception as exc:
-            await handle_api_error(exc, context="cache_write ohlcv")
+            await handle_api_error(exc, context=f"cache_write ohlcv {cache_file}")
     return results
 
 
@@ -263,6 +298,9 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
                     }
                 ]
             )
+            await logger.log_info(
+                f"Fetched tickers for {spot_symbol}/{futures_symbol}"
+            )
             return data
         except Exception as exc:
             await handle_api_error(
@@ -271,6 +309,36 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
             if attempt == 3:
                 return {}
     return {}
+
+
+# ---------------------------------------------------------------------------
+# 3b. get_multiple_tickers
+# ---------------------------------------------------------------------------
+async def get_multiple_tickers(
+    symbols: List[str], contract_type: str = "spot"
+) -> Dict[str, Dict[str, Optional[float]]]:
+    """Fetch tickers for many symbols in parallel."""
+    if _client is None:
+        await logger.log_error("Bybit client not connected", RuntimeError("no client"))
+        return {}
+
+    category = "spot" if contract_type == "spot" else "linear"
+    tasks = []
+    api_symbols = []
+    for sym in symbols:
+        api_sym = sym if contract_type == "spot" else _normalize_futures_symbol(sym)
+        api_symbols.append(sym)
+        tasks.append(_client.fetch_ticker(api_sym, params={"category": category}))
+
+    tickers = await asyncio.gather(*tasks, return_exceptions=True)
+    results: Dict[str, Dict[str, Optional[float]]] = {}
+    for sym, ticker in zip(api_symbols, tickers):
+        if isinstance(ticker, Exception):
+            await handle_api_error(ticker, context=f"bulk_ticker {sym}")
+        else:
+            results[sym] = {"bid": ticker.get("bid"), "ask": ticker.get("ask")}
+    await logger.log_info(f"Fetched {len(results)} tickers")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -312,9 +380,11 @@ async def get_funding_rate_history(symbol: str, start_date: str, end_date: str) 
                 await logger.log_warning(f"Cache format invalid: {cache_file}")
             else:
                 await asyncio.to_thread(cache_file.unlink)
+                await logger.log_info(f"Cache expired: {cache_file}")
         except json.JSONDecodeError as exc:
             await logger.log_warning(f"Cache corrupted {cache_file}: {exc}")
             await asyncio.to_thread(cache_file.unlink)
+            await logger.log_info(f"Corrupt cache removed: {cache_file}")
         except Exception as exc:
             await handle_api_error(exc, context="cache_read funding")
 
@@ -330,10 +400,13 @@ async def get_funding_rate_history(symbol: str, start_date: str, end_date: str) 
                 }
                 for r in fr
             ]
+            await logger.log_info(f"Fetched {len(data)} funding rates for {symbol}")
             try:
                 await asyncio.to_thread(cache_file.write_text, json.dumps(data))
+                await logger.log_info(f"Cached funding to {cache_file}")
+                await _enforce_cache_limit()
             except Exception as exc:
-                await handle_api_error(exc, context="cache_write funding")
+                await handle_api_error(exc, context=f"cache_write funding {cache_file}")
             return data
         except Exception as exc:
             await handle_api_error(exc, attempt, context=f"funding {symbol}")
@@ -442,11 +515,13 @@ async def place_order(
                 price,
                 params={"category": category},
             )
-            await logger.log_info(f"Placed order {order.get('id')}")
+            await logger.log_info(
+                f"Placed {side_l} {amount} {symbol} at {price} ({order.get('id')})"
+            )
             return {"order_id": order.get("id")}
         except Exception as exc:
             await handle_api_error(
-                exc, attempt, context=f"place_order {symbol} {side_l}"
+                exc, attempt, context=f"place_order {symbol} {side_l} amt={amount} price={price}"
             )
             if attempt == 3:
                 return {}
@@ -478,11 +553,11 @@ async def cancel_order(symbol: str, order_id: str, contract_type: str = "spot") 
     for attempt in range(1, 4):
         try:
             await _client.cancel_order(order_id, api_symbol, params={"category": category})
-            await logger.log_info(f"Cancelled order {order_id}")
+            await logger.log_info(f"Cancelled order {order_id} on {symbol}")
             return True
         except Exception as exc:
             await handle_api_error(
-                exc, attempt, context=f"cancel_order {order_id}"
+                exc, attempt, context=f"cancel_order {order_id} {symbol}"
             )
             if attempt == 3:
                 return False
@@ -531,8 +606,9 @@ async def cache_data(data: List[Dict[str, Any]]) -> None:
         content = json.dumps(data)
         await asyncio.to_thread(file_path.write_text, content)
         await logger.log_info(f"Cached data to {file_path}")
+        await _enforce_cache_limit()
     except Exception as exc:
-        await handle_api_error(exc, context="cache_data")
+        await handle_api_error(exc, context=f"cache_data {file_path}")
 
 
 # ---------------------------------------------------------------------------

@@ -263,6 +263,12 @@ def validate_config(config: Dict[str, Any]) -> bool:
             if tttl <= 0:
                 raise ValueError("TICKER_CACHE_TTL_SECONDS must be positive")
             config["TICKER_CACHE_TTL_SECONDS"] = tttl
+
+        if "CACHE_MAX_MB" in config:
+            max_mb = int(config["CACHE_MAX_MB"])
+            if max_mb <= 0:
+                raise ValueError("CACHE_MAX_MB must be positive")
+            config["CACHE_MAX_MB"] = max_mb
     except Exception as exc:  # broad to keep example child friendly
         logger.error("Validation failed: %s", exc)
         try:
@@ -459,7 +465,27 @@ def get_ticker_cache_ttl() -> float:
 
 
 # ---------------------------------------------------------------------------
-# 11. update_config
+# 11. get_cache_max_bytes
+# ---------------------------------------------------------------------------
+def get_cache_max_bytes() -> int:
+    """Return the maximum cache directory size in bytes.
+
+    Example
+    -------
+    >>> CONFIG['CACHE_MAX_MB'] = '1'
+    >>> get_cache_max_bytes()
+    1048576
+    """
+    cfg = load_config()
+    try:
+        mb = int(cfg.get("CACHE_MAX_MB", 50))
+    except ValueError:
+        mb = 50
+    return max(mb, 0) * 1_048_576
+
+
+# ---------------------------------------------------------------------------
+# 12. update_config
 # ---------------------------------------------------------------------------
 async def update_config(key: str, value: Any) -> None:
     """Asynchronously update a single configuration value.
@@ -511,7 +537,7 @@ async def update_config(key: str, value: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 12. backup_config
+# 13. backup_config
 # ---------------------------------------------------------------------------
 async def backup_config() -> None:
     """Create a timestamped copy of ``.env`` using a background thread.

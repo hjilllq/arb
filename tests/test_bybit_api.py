@@ -276,6 +276,49 @@ async def test_historical_cache_corrupted(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_bulk_tickers(monkeypatch):
+    class DummyClient:
+        def __init__(self):
+            self.called = []
+
+        async def fetch_ticker(self, symbol, params=None):
+            self.called.append(symbol)
+            return {"bid": 1, "ask": 2}
+
+    bybit_api._client = DummyClient()
+    logs: list[str] = []
+
+    async def fake_log(msg):
+        logs.append(msg)
+
+    monkeypatch.setattr(bybit_api.logger, "log_info", fake_log)
+    res = await bybit_api.get_multiple_tickers(["BTC/USDT", "ETH/USDT"])
+    assert set(bybit_api._client.called) == {"BTC/USDT", "ETH/USDT"}
+    assert res["ETH/USDT"]["ask"] == 2
+    assert any("Fetched 2 tickers" in m for m in logs)
+
+
+@pytest.mark.asyncio
+async def test_enforce_cache_limit(monkeypatch, tmp_path):
+    monkeypatch.setattr(bybit_api, "_CACHE_DIR", tmp_path)
+    f1 = tmp_path / "a.json"
+    f1.write_text("x" * 40)
+    time.sleep(0.01)
+    f2 = tmp_path / "b.json"
+    f2.write_text("x" * 40)
+    monkeypatch.setattr(bybit_api.config, "get_cache_max_bytes", lambda: 50)
+    logs: list[str] = []
+
+    async def fake_log(msg):
+        logs.append(msg)
+
+    monkeypatch.setattr(bybit_api.logger, "log_info", fake_log)
+    await bybit_api._enforce_cache_limit()
+    assert len(list(tmp_path.iterdir())) == 1
+    assert any("Cache trimmed" in m for m in logs)
+
+
+@pytest.mark.asyncio
 async def test_ticker_cache_respects_ttl(monkeypatch):
     """Ticker cache should reuse data until the TTL expires."""
 

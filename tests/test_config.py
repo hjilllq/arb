@@ -108,3 +108,23 @@ def test_cache_ttl_helpers(monkeypatch):
     monkeypatch.setattr(config, 'CONFIG', {'CACHE_TTL_SECONDS': '42', 'TICKER_CACHE_TTL_SECONDS': '2.5'})
     assert config.get_cache_ttl() == 42
     assert config.get_ticker_cache_ttl() == 2.5
+
+
+def test_cache_size_helper(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {'CACHE_MAX_MB': '1'})
+    assert config.get_cache_max_bytes() == 1 * 1_048_576
+
+
+def test_validate_config_cache_limit():
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'CACHE_MAX_MB': '10'
+    }
+    assert config.validate_config(good)
+
+    bad = good.copy()
+    bad['CACHE_MAX_MB'] = '0'
+    assert not config.validate_config(bad)
