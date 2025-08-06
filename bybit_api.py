@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import time
+import resource
 
 import aiohttp
 import ccxt.async_support as ccxt
@@ -44,6 +46,16 @@ _CACHE_STATS = {
     "disk_bytes": 0,
     "ticker_entries": 0,
 }
+
+
+def _rss_bytes() -> int:
+    """Return the current resident set size in bytes."""
+    try:  # Prefer psutil when available for portability
+        import psutil  # type: ignore
+
+        return psutil.Process(os.getpid()).memory_info().rss
+    except Exception:  # pragma: no cover - psutil missing or failing
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
 
 # Background task that periodically checks cache usage.
 _cache_monitor_task: Optional[asyncio.Task] = None
@@ -85,6 +97,9 @@ async def monitor_cache_usage() -> None:
             from notification_manager import notify  # type: ignore
 
             detail = f"{size} bytes ({usage:.0%}) of {limit}"
+            channels = config.get_cache_notify_channels()
+            if channels:
+                detail += f" via {channels}"
             await notify("Cache nearly full", detail)
         except Exception:
             pass
@@ -94,10 +109,44 @@ async def monitor_cache_usage() -> None:
         )
 
 
+async def monitor_memory_usage() -> None:
+    """Log current process memory and warn when nearing configured limit."""
+
+    limit = config.get_memory_max_bytes()
+    if limit <= 0:
+        return
+
+    try:
+        usage = await asyncio.to_thread(_rss_bytes)
+    except Exception as exc:  # pragma: no cover - unexpected failure
+        await handle_api_error(exc, context="memory_usage")
+        return
+
+    _CACHE_STATS.setdefault("mem_bytes", 0)
+    _CACHE_STATS["mem_bytes"] = usage
+    ratio = usage / limit
+    if ratio >= 0.9:
+        await logger.log_warning(
+            f"Memory usage {usage} bytes ({ratio:.0%}) exceeds 90% of limit {limit}"
+        )
+        try:
+            from notification_manager import notify  # type: ignore
+
+            detail = f"{usage} bytes ({ratio:.0%}) of {limit}"
+            await notify("Memory nearly full", detail)
+        except Exception:
+            pass
+    else:
+        await logger.log_info(
+            f"Memory usage {usage} bytes ({ratio:.0%}) within limit {limit}"
+        )
+
+
 async def _cache_monitor_loop(interval: float) -> None:
     """Background task that periodically logs cache size."""
     while True:  # pragma: no cover - loop control tested via start/stop
         await monitor_cache_usage()
+        await monitor_memory_usage()
         await asyncio.sleep(interval)
 
 
@@ -148,6 +197,7 @@ async def _enforce_cache_limit() -> None:
     except Exception as exc:
         await handle_api_error(exc, context="cache_prune")
     await monitor_cache_usage()
+    await monitor_memory_usage()
 
 
 def _normalize_futures_symbol(symbol: str) -> str:
@@ -206,6 +256,8 @@ async def connect_api(
         mapping = config.get_pair_mapping()
         await logger.log_info("Connected to Bybit API")
         await logger.log_info(f"Pair mapping warmed with {len(mapping)} items")
+        await monitor_cache_usage()
+        await monitor_memory_usage()
     except Exception as exc:
         # Close the client on failure to avoid dangling connections.
         try:

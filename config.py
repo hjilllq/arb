@@ -270,6 +270,12 @@ def validate_config(config: Dict[str, Any]) -> bool:
                 raise ValueError("CACHE_MAX_MB must be positive")
             config["CACHE_MAX_MB"] = max_mb
 
+        if "MEMORY_MAX_MB" in config:
+            mem_mb = int(config["MEMORY_MAX_MB"])
+            if mem_mb <= 0:
+                raise ValueError("MEMORY_MAX_MB must be positive")
+            config["MEMORY_MAX_MB"] = mem_mb
+
         # Optional retry delay settings for Bybit API helpers
         if "API_RETRY_BASE_DELAY" in config or "API_RETRY_MAX_DELAY" in config:
             base = float(config.get("API_RETRY_BASE_DELAY", 5))
@@ -491,6 +497,35 @@ def get_cache_max_bytes() -> int:
     except ValueError:
         mb = 50
     return max(mb, 0) * 1_048_576
+
+
+# ---------------------------------------------------------------------------
+# 11a. get_memory_max_bytes
+# ---------------------------------------------------------------------------
+def get_memory_max_bytes() -> int:
+    """Return the memory usage limit in bytes.
+
+    Example
+    -------
+    >>> CONFIG['MEMORY_MAX_MB'] = '2'
+    >>> get_memory_max_bytes()
+    2097152
+    """
+    cfg = load_config()
+    try:
+        mb = int(cfg.get("MEMORY_MAX_MB", 0))
+    except ValueError:
+        mb = 0
+    return max(mb, 0) * 1_048_576
+
+
+# ---------------------------------------------------------------------------
+# 11b. get_cache_notify_channels
+# ---------------------------------------------------------------------------
+def get_cache_notify_channels() -> str:
+    """Return comma-separated channels for cache alerts."""
+    cfg = load_config()
+    return str(cfg.get("CACHE_NOTIFY_CHANNELS", "")).strip()
 
 
 # ---------------------------------------------------------------------------

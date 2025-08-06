@@ -416,6 +416,7 @@ async def test_monitor_cache_usage_notifies(monkeypatch, tmp_path):
     f = tmp_path / "a.json"
     f.write_text("x" * 95)
     monkeypatch.setattr(bybit_api.config, "get_cache_max_bytes", lambda: 100)
+    monkeypatch.setattr(bybit_api.config, "get_cache_notify_channels", lambda: "email")
     warnings: list[str] = []
     async def fake_warn(msg):
         warnings.append(msg)
@@ -427,7 +428,26 @@ async def test_monitor_cache_usage_notifies(monkeypatch, tmp_path):
     module.notify = fake_notify
     monkeypatch.setitem(sys.modules, "notification_manager", module)
     await bybit_api.monitor_cache_usage()
-    assert warnings and notified
+    assert warnings and notified and "email" in notified[0]
+
+
+@pytest.mark.asyncio
+async def test_monitor_memory_usage_notifies(monkeypatch):
+    monkeypatch.setattr(bybit_api.config, "get_memory_max_bytes", lambda: 100)
+    monkeypatch.setattr(bybit_api, "_rss_bytes", lambda: 95)
+    warned: list[str] = []
+    async def fake_warn(msg):
+        warned.append(msg)
+    monkeypatch.setattr(bybit_api.logger, "log_warning", fake_warn)
+    module = types.SimpleNamespace()
+    noted: list[str] = []
+    async def fake_notify(title, detail):
+        noted.append(detail)
+    module.notify = fake_notify
+    monkeypatch.setitem(sys.modules, "notification_manager", module)
+    await bybit_api.monitor_memory_usage()
+    assert warned and noted
+    assert bybit_api._CACHE_STATS.get("mem_bytes") == 95
 
 
 @pytest.mark.asyncio
@@ -456,10 +476,11 @@ async def test_start_cache_monitor(monkeypatch):
     async def fake_monitor():
         calls.append(1)
     monkeypatch.setattr(bybit_api, "monitor_cache_usage", fake_monitor)
+    monkeypatch.setattr(bybit_api, "monitor_memory_usage", fake_monitor)
     bybit_api.start_cache_monitor(interval=0.01)
     await asyncio.sleep(0.03)
     await bybit_api.stop_cache_monitor()
-    assert len(calls) >= 2
+    assert len(calls) >= 4  # both monitors run
 
 
 @pytest.mark.asyncio
@@ -517,6 +538,29 @@ async def test_multiple_tickers_stress(monkeypatch):
     assert len(res) == 20
     assert bybit_api._client.calls == 20
     assert elapsed < 0.15  # concurrent gather should be fast
+
+
+@pytest.mark.asyncio
+async def test_multiple_tickers_high_load(monkeypatch):
+    class DummyClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_ticker(self, symbol, params=None):
+            self.calls += 1
+            await asyncio.sleep(0.005)
+            return {"bid": 1, "ask": 2}
+
+    bybit_api._client = DummyClient()
+    symbols = [f"SYM{i}/USDT" for i in range(50)]
+    start = time.perf_counter()
+    for _ in range(3):
+        res = await bybit_api.get_multiple_tickers(symbols)
+        assert len(res) == 50
+    elapsed = time.perf_counter() - start
+    # 50 symbols * 0.005s / batch ~0.25 if sequential; concurrent should be <0.4
+    assert bybit_api._client.calls == 150
+    assert elapsed < 0.4
 
 
 @pytest.mark.asyncio
