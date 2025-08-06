@@ -72,3 +72,26 @@ async def test_close_and_pnl(reset):
     expected = (105.0 - 100.0) - (109.0 - 110.0)
     fees = (100 + 110 + 105 + 109) * 0.00075
     assert pytest.approx(expected - fees, rel=1e-6) == pnl
+
+
+@pytest.mark.asyncio
+async def test_close_retries_on_failure(reset, monkeypatch):
+    class Flaky(DummyAPI):
+        def __init__(self):
+            super().__init__()
+            self.count = 0
+
+        async def place_order(self, symbol, side, amount, price, order_type="limit", contract_type="spot"):
+            self.count += 1
+            if self.count == 3:  # first close attempt fails
+                return None
+            return await super().place_order(symbol, side, amount, price, order_type, contract_type)
+
+    api = Flaky()
+    monkeypatch.setattr(pm, "bybit_api", api)
+    monkeypatch.setattr(pm, "_RETRY_DELAY", 0)
+    res = await pm.open_position("BTC/USDT", "BTCUSDT", "buy", 1, 100.0, 110.0)
+    ok = await pm.close_position(res["spot_order_id"], res["futures_order_id"])
+    assert ok
+    # two opens + one failed close + retry + futures close = 5 calls
+    assert api.count >= 5

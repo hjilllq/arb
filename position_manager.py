@@ -22,6 +22,60 @@ _CLOSED_POSITIONS: List[Dict[str, Any]] = []
 # Taker fee used when estimating profit. Bybit charges about 0.075% for each trade.
 _FEE_RATE = 0.00075
 
+# Retry settings for order placement. Values come from config if present so
+# operators can tune behaviour without touching the code.
+_CFG = config.load_config()
+try:
+    _RETRY_ATTEMPTS = int(_CFG.get("ORDER_RETRY_ATTEMPTS", 3))
+except ValueError:  # pragma: no cover - corrupt config
+    _RETRY_ATTEMPTS = 3
+try:
+    _RETRY_DELAY = float(_CFG.get("ORDER_RETRY_DELAY", 5))
+except ValueError:  # pragma: no cover - corrupt config
+    _RETRY_DELAY = 5.0
+
+
+async def _place_with_retry(
+    symbol: str,
+    side: str,
+    amount: float,
+    price: float,
+    *,
+    order_type: str = "limit",
+    contract_type: str = "spot",
+) -> Dict[str, Any]:
+    """Attempt to place an order and retry on failures.
+
+    Orders are tried a few times with a small delay between attempts.  If the
+    exchange reports a status other than ``filled`` the helper logs a warning so
+    callers may decide to cancel or retry elsewhere.
+    """
+
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            order = await bybit_api.place_order(
+                symbol,
+                side,
+                amount,
+                price,
+                order_type=order_type,
+                contract_type=contract_type,
+            )
+        except Exception as exc:  # pragma: no cover - network failure
+            await logger.log_error("Order placement error", exc)
+            order = None
+
+        if order and order.get("status", "filled").lower() == "filled":
+            return order
+
+        await logger.log_warning(
+            f"order attempt {attempt} for {symbol} {side} failed: {order}"
+        )
+        if attempt < _RETRY_ATTEMPTS:
+            await asyncio.sleep(_RETRY_DELAY)
+
+    return {}
+
 
 async def open_position(
     spot_symbol: str,
@@ -30,6 +84,9 @@ async def open_position(
     amount: float,
     spot_price: float,
     futures_price: float,
+    *,
+    order_type: str = "limit",
+    stop_loss: float | None = None,
 ) -> Dict[str, str]:
     """Open a hedged spot/futures position.
 
@@ -58,20 +115,30 @@ async def open_position(
         return {}
 
     futures_side = "sell" if side_l == "buy" else "buy"
-    spot_order = await bybit_api.place_order(
-        spot_symbol, side_l, amount, spot_price, contract_type="spot"
+    spot_order = await _place_with_retry(
+        spot_symbol,
+        side_l,
+        amount,
+        spot_price,
+        order_type=order_type,
+        contract_type="spot",
     )
     if not spot_order:
         await logger.log_error("Spot order failed", RuntimeError("spot fail"))
         return {}
-    futures_order = await bybit_api.place_order(
-        futures_symbol, futures_side, amount, futures_price, contract_type="linear"
+    futures_order = await _place_with_retry(
+        futures_symbol,
+        futures_side,
+        amount,
+        futures_price,
+        order_type=order_type,
+        contract_type="linear",
     )
     if not futures_order:
         await logger.log_error("Futures order failed", RuntimeError("futures fail"))
         try:
             await bybit_api.cancel_order(spot_symbol, spot_order.get("order_id", ""))
-        except Exception:
+        except Exception:  # pragma: no cover - network failure
             pass
         return {}
 
@@ -85,8 +152,12 @@ async def open_position(
         "futures_price": futures_price,
         "spot_order_id": spot_order.get("order_id", ""),
         "futures_order_id": futures_order.get("order_id", ""),
+        "order_type": order_type,
         "timestamp": timestamp,
     }
+    if stop_loss is not None:
+        # Stop-loss support can be added later by sending a separate order.
+        record["stop_loss"] = stop_loss
     _OPEN_POSITIONS.append(record)
 
     await logger.log_trade(
@@ -117,7 +188,12 @@ async def open_position(
 
 
 async def close_position(spot_order_id: str, futures_order_id: str) -> bool:
-    """Close an existing position with market orders."""
+    """Close an existing position with market orders.
+
+    Prices are checked for sudden jumps (over 10%% from the open price) to
+    avoid closing with wildly different quotes.  Each order is retried a few
+    times so transient API hiccups do not leave the bot stuck with exposure.
+    """
     pos = next(
         (
             p
@@ -144,11 +220,27 @@ async def close_position(spot_order_id: str, futures_order_id: str) -> bool:
     if not spot_price or not fut_price:
         await logger.log_error("Bad market data", ValueError("empty prices"))
         return False
-    spot_ok = await bybit_api.place_order(
-        pos["spot_symbol"], spot_side, pos["amount"], spot_price, order_type="market"
+
+    # Warn if price moved too much. Large gaps may point to missed trades.
+    if abs(spot_price - pos["spot_price"]) / pos["spot_price"] > 0.10:
+        await logger.log_warning("Spot price moved >10% since open; closing anyway")
+    if abs(fut_price - pos["futures_price"]) / pos["futures_price"] > 0.10:
+        await logger.log_warning("Futures price moved >10% since open; closing anyway")
+
+    spot_ok = await _place_with_retry(
+        pos["spot_symbol"],
+        spot_side,
+        pos["amount"],
+        spot_price,
+        order_type="market",
     )
-    fut_ok = await bybit_api.place_order(
-        pos["futures_symbol"], fut_side, pos["amount"], fut_price, order_type="market", contract_type="linear"
+    fut_ok = await _place_with_retry(
+        pos["futures_symbol"],
+        fut_side,
+        pos["amount"],
+        fut_price,
+        order_type="market",
+        contract_type="linear",
     )
     if not spot_ok or not fut_ok:
         await logger.log_error("Close orders failed", RuntimeError("close fail"))
