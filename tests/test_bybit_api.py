@@ -273,3 +273,64 @@ async def test_historical_cache_corrupted(monkeypatch, tmp_path):
     # cache file replaced with valid JSON
     parsed = json.loads(cache_file.read_text())
     assert parsed[0]["open"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ticker_cache_respects_ttl(monkeypatch):
+    """Ticker cache should reuse data until the TTL expires."""
+
+    class DummyClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_ticker(self, symbol, params=None):
+            self.calls += 1
+            # Return distinct values per call so cache hits are evident
+            return {"bid": self.calls, "ask": self.calls}
+
+    bybit_api._client = DummyClient()
+    bybit_api._TICKER_CACHE.clear()
+    monkeypatch.setattr(bybit_api.database, "save_data", lambda *a, **k: asyncio.sleep(0))
+    monkeypatch.setattr(bybit_api.config, "get_ticker_cache_ttl", lambda: 1)
+
+    t = 0.0
+
+    def fake_monotonic():
+        return t
+
+    monkeypatch.setattr(bybit_api.time, "monotonic", fake_monotonic)
+
+    await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
+    assert bybit_api._client.calls == 2
+
+    t = 0.5  # within TTL, should hit cache
+    await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
+    assert bybit_api._client.calls == 2
+
+    t = 1.5  # TTL expired, should refetch
+    await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
+    assert bybit_api._client.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_ticker_cache_disabled_with_zero_ttl(monkeypatch):
+    """A zero TTL disables ticker caching entirely."""
+
+    class DummyClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_ticker(self, symbol, params=None):
+            self.calls += 1
+            return {"bid": self.calls, "ask": self.calls}
+
+    bybit_api._client = DummyClient()
+    bybit_api._TICKER_CACHE.clear()
+    monkeypatch.setattr(bybit_api.database, "save_data", lambda *a, **k: asyncio.sleep(0))
+    monkeypatch.setattr(bybit_api.config, "get_ticker_cache_ttl", lambda: 0)
+    monkeypatch.setattr(bybit_api.time, "monotonic", lambda: 0)
+
+    await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
+    await bybit_api.get_spot_futures_data("BTC/USDT", "BTCUSDT")
+    # Each call fetches both spot and futures tickers (2 calls per request)
+    assert bybit_api._client.calls == 4
