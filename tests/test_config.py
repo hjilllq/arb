@@ -155,6 +155,33 @@ def test_validate_config_memory_limit():
     assert not config.validate_config(bad)
 
 
+def test_slippage_helpers(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        'CONFIG',
+        {'SPOT_SLIPPAGE': '0.002', 'FUTURES_SLIPPAGE': '0.003', 'MAX_BASIS_RISK': '0.02'},
+    )
+    assert config.get_spot_slippage() == 0.002
+    assert config.get_futures_slippage() == 0.003
+    assert config.get_max_basis_risk() == 0.02
+
+
+def test_validate_slippage_positive():
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'SPOT_SLIPPAGE': '0.001',
+        'FUTURES_SLIPPAGE': '0.001',
+        'MAX_BASIS_RISK': '0.05',
+    }
+    assert config.validate_config(good)
+    bad = good.copy()
+    bad['FUTURES_SLIPPAGE'] = '0'
+    assert not config.validate_config(bad)
+
+
 def test_retry_delay_helpers(monkeypatch):
     monkeypatch.setattr(config, 'CONFIG', {
         'API_RETRY_BASE_DELAY': '1.5',

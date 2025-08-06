@@ -328,16 +328,21 @@ async def check_exchange_health(exchange_name: str) -> bool:
                 await notify("Exchange outage", f"{name} down {minutes}m")
         logger.error("Exchange %s not registered", name)
         return False
+    err = None
     try:
         await asyncio.wait_for(client.fetch_time(), timeout=10)
     except RateLimitExceeded as exc:
         err_kind = "rate limit"
+        err = exc
     except (NetworkError, asyncio.TimeoutError) as exc:
         err_kind = "network"
+        err = exc
     except ExchangeError as exc:
         err_kind = "api"
+        err = exc
     except Exception as exc:  # pragma: no cover - unexpected
         err_kind = "unknown"
+        err = exc
     else:
         _last_health[name] = now
         _FAIL_COUNTS[name] = 0
@@ -346,8 +351,8 @@ async def check_exchange_health(exchange_name: str) -> bool:
         logger.debug("Exchange %s healthy", name)
         return True
 
-    logger.warning("Health check %s error for %s: %s", err_kind, name, exc)
-    await notify("Exchange health failed", f"{name} ({err_kind}): {exc}")
+    logger.warning("Health check %s error for %s: %s", err_kind, name, err)
+    await notify("Exchange health failed", f"{name} ({err_kind}): {err}")
     failures = _FAIL_COUNTS.get(name, 0) + 1
     _FAIL_COUNTS[name] = failures
     if failures >= _MAX_FAILURES:

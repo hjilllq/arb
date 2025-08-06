@@ -13,3 +13,8 @@ class DummyExchange:
 # bybit constructor placeholder; tests monkeypatch this with a fake client.
 def bybit(config=None):  # pragma: no cover - only used when not patched
     return DummyExchange()
+
+
+# binance constructor placeholder so tests can monkeypatch it too
+def binance(config=None):  # pragma: no cover - only used when not patched
+    return DummyExchange()

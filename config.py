@@ -276,6 +276,14 @@ def validate_config(config: Dict[str, Any]) -> bool:
                 raise ValueError("MEMORY_MAX_MB must be positive")
             config["MEMORY_MAX_MB"] = mem_mb
 
+        # Optional slippage and risk settings
+        for key in ("SPOT_SLIPPAGE", "FUTURES_SLIPPAGE", "MAX_BASIS_RISK"):
+            if key in config:
+                val = float(config[key])
+                if val <= 0:
+                    raise ValueError(f"{key} must be positive")
+                config[key] = val
+
         # Optional retry delay settings for Bybit API helpers
         if "API_RETRY_BASE_DELAY" in config or "API_RETRY_MAX_DELAY" in config:
             base = float(config.get("API_RETRY_BASE_DELAY", 5))
@@ -477,6 +485,39 @@ def get_ticker_cache_ttl() -> float:
     except ValueError:
         ttl = 1.0
     return max(ttl, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 11. get_spot_slippage / get_futures_slippage / get_max_basis_risk
+# ---------------------------------------------------------------------------
+def get_spot_slippage() -> float:
+    """Return estimated slippage for spot trades as a fraction."""
+    cfg = load_config()
+    try:
+        val = float(cfg.get("SPOT_SLIPPAGE", 0.001))
+    except ValueError:
+        val = 0.001
+    return max(val, 0.0)
+
+
+def get_futures_slippage() -> float:
+    """Return estimated slippage for futures trades as a fraction."""
+    cfg = load_config()
+    try:
+        val = float(cfg.get("FUTURES_SLIPPAGE", 0.001))
+    except ValueError:
+        val = 0.001
+    return max(val, 0.0)
+
+
+def get_max_basis_risk() -> float:
+    """Return the maximum tolerated basis before trades are paused."""
+    cfg = load_config()
+    try:
+        val = float(cfg.get("MAX_BASIS_RISK", 0.05))
+    except ValueError:
+        val = 0.05
+    return max(val, 0.0)
 
 
 # ---------------------------------------------------------------------------
