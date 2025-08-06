@@ -11,7 +11,8 @@ import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import time
 
 import aiohttp
 import ccxt.async_support as ccxt
@@ -27,6 +28,9 @@ _CACHE_DIR.mkdir(exist_ok=True)
 
 # Global exchange client created in :func:`connect_api`.
 _client: Optional[ccxt.bybit] = None
+
+# In-memory cache for recent tickers to avoid hammering the API.
+_TICKER_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
 
 
 def _normalize_futures_symbol(symbol: str) -> str:
@@ -90,7 +94,7 @@ async def connect_api(
             await _client.close()
         finally:
             _client = None
-        await handle_api_error(exc)
+        await handle_api_error(exc, context="connect_api")
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +142,16 @@ async def get_historical_data(
     category = "spot" if contract_type == "spot" else "linear"
     api_symbol = symbol if contract_type == "spot" else _normalize_futures_symbol(symbol)
 
+    # Check cache before requesting the API to reduce load.
+    cache_name = f"ohlcv_{api_symbol.replace('/', '')}_{timeframe}_{start_date}_{end_date}.json"
+    cache_file = _CACHE_DIR / cache_name
+    if cache_file.exists():
+        try:
+            text = await asyncio.to_thread(cache_file.read_text)
+            return json.loads(text)
+        except Exception:
+            pass
+
     results: List[Dict[str, Any]] = []
     while since < until:
         for attempt in range(1, 4):
@@ -151,7 +165,9 @@ async def get_historical_data(
                 )
                 break
             except Exception as exc:
-                await handle_api_error(exc, attempt)
+                await handle_api_error(
+                    exc, attempt, context=f"fetch_ohlcv {api_symbol} {timeframe}"
+                )
                 if attempt == 3:
                     return results
         if not ohlcv:
@@ -172,6 +188,11 @@ async def get_historical_data(
             break
     if not results:
         await logger.log_warning(f"No historical data for {symbol}")
+    else:
+        try:
+            await asyncio.to_thread(cache_file.write_text, json.dumps(results))
+        except Exception as exc:
+            await handle_api_error(exc, context="cache_write ohlcv")
     return results
 
 
@@ -200,6 +221,12 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
 
     api_fut = _normalize_futures_symbol(futures_symbol)
 
+    key = (spot_symbol, futures_symbol)
+    now = time.monotonic()
+    cached = _TICKER_CACHE.get(key)
+    if cached and now - cached[0] < 1:
+        return cached[1]
+
     for attempt in range(1, 4):
         try:
             spot_ticker, fut_ticker = await asyncio.gather(
@@ -213,6 +240,7 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
                     "ask": fut_ticker.get("ask"),
                 },
             }
+            _TICKER_CACHE[key] = (now, data)
             await database.save_data(
                 [
                     {
@@ -226,7 +254,9 @@ async def get_spot_futures_data(spot_symbol: str, futures_symbol: str) -> Dict[s
             )
             return data
         except Exception as exc:
-            await handle_api_error(exc, attempt)
+            await handle_api_error(
+                exc, attempt, context=f"ticker {spot_symbol}/{futures_symbol}"
+            )
             if attempt == 3:
                 return {}
     return {}
@@ -257,20 +287,35 @@ async def get_funding_rate_history(symbol: str, start_date: str, end_date: str) 
     since = int(datetime.fromisoformat(start_date).timestamp() * 1000)
     until = int(datetime.fromisoformat(end_date).timestamp() * 1000)
     api_symbol = _normalize_futures_symbol(symbol)
+
+    cache_name = f"funding_{api_symbol}_{start_date}_{end_date}.json"
+    cache_file = _CACHE_DIR / cache_name
+    if cache_file.exists():
+        try:
+            text = await asyncio.to_thread(cache_file.read_text)
+            return json.loads(text)
+        except Exception:
+            pass
+
     for attempt in range(1, 4):
         try:
             fr = await _client.fetch_funding_rate_history(
                 api_symbol, since=since, params={"until": until, "category": "linear"}
             )
-            return [
+            data = [
                 {
                     "timestamp": datetime.utcfromtimestamp(r["timestamp"] / 1000).isoformat(),
                     "funding_rate": r["fundingRate"],
                 }
                 for r in fr
             ]
+            try:
+                await asyncio.to_thread(cache_file.write_text, json.dumps(data))
+            except Exception as exc:
+                await handle_api_error(exc, context="cache_write funding")
+            return data
         except Exception as exc:
-            await handle_api_error(exc, attempt)
+            await handle_api_error(exc, attempt, context=f"funding {symbol}")
             if attempt == 3:
                 return []
     return []
@@ -321,7 +366,7 @@ async def subscribe_to_websocket(
                         received += 1
                     return
         except Exception as exc:
-            await handle_api_error(exc)
+            await handle_api_error(exc, context=f"websocket {symbol}")
             continue
 
 
@@ -379,7 +424,9 @@ async def place_order(
             await logger.log_info(f"Placed order {order.get('id')}")
             return {"order_id": order.get("id")}
         except Exception as exc:
-            await handle_api_error(exc, attempt)
+            await handle_api_error(
+                exc, attempt, context=f"place_order {symbol} {side_l}"
+            )
             if attempt == 3:
                 return {}
     return {}
@@ -413,7 +460,9 @@ async def cancel_order(symbol: str, order_id: str, contract_type: str = "spot") 
             await logger.log_info(f"Cancelled order {order_id}")
             return True
         except Exception as exc:
-            await handle_api_error(exc, attempt)
+            await handle_api_error(
+                exc, attempt, context=f"cancel_order {order_id}"
+            )
             if attempt == 3:
                 return False
     return False
@@ -440,7 +489,7 @@ async def get_balance() -> Dict[str, Any]:
             balance = await _client.fetch_balance()
             return balance.get("total", {})
         except Exception as exc:
-            await handle_api_error(exc, attempt)
+            await handle_api_error(exc, attempt, context="get_balance")
             if attempt == 3:
                 return {}
     return {}
@@ -462,13 +511,15 @@ async def cache_data(data: List[Dict[str, Any]]) -> None:
         await asyncio.to_thread(file_path.write_text, content)
         await logger.log_info(f"Cached data to {file_path}")
     except Exception as exc:
-        await handle_api_error(exc)
+        await handle_api_error(exc, context="cache_data")
 
 
 # ---------------------------------------------------------------------------
 # 10. handle_api_error
 # ---------------------------------------------------------------------------
-async def handle_api_error(error: Exception, attempt: int = 1) -> None:
+async def handle_api_error(
+    error: Exception, attempt: int = 1, *, context: str = ""
+) -> None:
     """Log API errors, notify the operator and wait before retrying.
 
     Parameters
@@ -478,9 +529,13 @@ async def handle_api_error(error: Exception, attempt: int = 1) -> None:
     attempt:
         Current retry attempt starting from ``1``.  The delay grows
         exponentially to calm down when the API is angry.
+    context:
+        Short description of the failed operation included in logs and
+        notifications.
     """
 
-    await logger.log_error("API error", error)
+    message = context or "API error"
+    await logger.log_error(message, error)
     delay = min(5 * 2 ** (attempt - 1), 60)
     if isinstance(error, ccxt.RateLimitExceeded):
         delay *= 2
@@ -489,7 +544,8 @@ async def handle_api_error(error: Exception, attempt: int = 1) -> None:
     try:
         from notification_manager import notify  # type: ignore
 
-        await notify("Bybit API error", f"{type(error).__name__}: {error}")
+        detail = f"{context} {type(error).__name__}: {error}".strip()
+        await notify("Bybit API error", detail)
     except Exception:
         pass
     await asyncio.sleep(delay)

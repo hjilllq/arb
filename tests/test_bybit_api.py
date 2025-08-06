@@ -61,6 +61,7 @@ async def test_connect_api(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_spot_futures_data(monkeypatch):
     bybit_api._client = DummyClient()
+    bybit_api._TICKER_CACHE.clear()
     captured = {}
     async def fake_save(data):
         captured["rows"] = data
@@ -120,10 +121,11 @@ async def test_retry_logic(monkeypatch):
             return self.tickers[symbol]
 
     bybit_api._client = DummyClient()
+    bybit_api._TICKER_CACHE.clear()
     monkeypatch.setattr(bybit_api.database, "save_data", lambda *a, **k: asyncio.sleep(0))
     attempts: list[int] = []
 
-    async def fake_handle(exc, attempt=1):
+    async def fake_handle(exc, attempt=1, context=""):
         attempts.append(attempt)
 
     monkeypatch.setattr(bybit_api, "handle_api_error", fake_handle)
@@ -140,9 +142,10 @@ async def test_retry_failure(monkeypatch):
             raise bybit_api.ccxt.NetworkError("down")
 
     bybit_api._client = DummyClient()
+    bybit_api._TICKER_CACHE.clear()
     attempts: list[int] = []
 
-    async def fake_handle(exc, attempt=1):
+    async def fake_handle(exc, attempt=1, context=""):
         attempts.append(attempt)
 
     monkeypatch.setattr(bybit_api, "handle_api_error", fake_handle)
@@ -189,3 +192,32 @@ async def test_place_order_validates_params(monkeypatch):
     res = await bybit_api.place_order("BTCUSDT", "buy", 1, 1, order_type="stop")
     assert res == {}
     assert any("Invalid order type" in m for m in errors)
+
+
+@pytest.mark.asyncio
+async def test_historical_data_cache(monkeypatch, tmp_path):
+    """Repeated historical queries should hit the API once due to caching."""
+
+    tmp_path.mkdir(exist_ok=True)
+    monkeypatch.setattr(bybit_api, "_CACHE_DIR", tmp_path)
+
+    class DummyClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
+            self.calls += 1
+            if self.calls == 1:
+                return [[since, 1, 1, 1, 1, 1]]
+            return []
+
+    bybit_api._client = DummyClient()
+    data1 = await bybit_api.get_historical_data(
+        "BTC/USDT", "1m", "2024-01-01", "2024-01-02"
+    )
+    first_calls = bybit_api._client.calls
+    data2 = await bybit_api.get_historical_data(
+        "BTC/USDT", "1m", "2024-01-01", "2024-01-02"
+    )
+    assert bybit_api._client.calls == first_calls
+    assert data1 == data2
