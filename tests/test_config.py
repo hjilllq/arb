@@ -1,0 +1,308 @@
+import json
+import sys
+import types
+from pathlib import Path
+from datetime import datetime
+import os
+import json
+
+import pytest
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+import config
+
+
+def test_load_config_missing_file(tmp_path, monkeypatch):
+    missing = tmp_path / "missing.env"
+    monkeypatch.setattr(config, "dotenv_values", lambda *a, **k: {})
+    monkeypatch.setattr(config, "os", types.SimpleNamespace(environ={}))
+    with pytest.raises(config.ConfigError):
+        config.load_config(str(missing), reload=True)
+
+
+def test_load_config_thresholds_json(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("SPOT_PAIRS=['BTC/USDT']\nFUTURES_PAIRS=['BTCUSDT']\nTHRESHOLDS_FILE=extra.json\n")
+    extra = tmp_path / "extra.json"
+    extra.write_text(json.dumps({
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': 0.005,
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': 0.001
+    }))
+    cfg = config.load_config(str(env), reload=True)
+    assert cfg['BTC_USDT_BASIS_THRESHOLD_OPEN'] == '0.005'
+    assert config.validate_config(cfg)
+
+
+def test_validate_config_pair_mismatch():
+    bad = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['ETHUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001'
+    }
+    assert not config.validate_config(bad)
+
+
+def test_validate_config_negative_threshold():
+    bad = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '-0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001'
+    }
+    assert not config.validate_config(bad)
+
+
+def test_load_config_thresholds_json_invalid(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("SPOT_PAIRS=['BTC/USDT']\nFUTURES_PAIRS=['BTCUSDT']\nTHRESHOLDS_FILE=extra.json\n")
+    extra = tmp_path / "extra.json"
+    extra.write_text("{bad json")
+    cfg = config.load_config(str(env), reload=True)
+    assert 'BTC_USDT_BASIS_THRESHOLD_OPEN' not in cfg
+
+
+def test_encrypt_decrypt_roundtrip():
+    data = {'API_KEY': 'abc', 'API_SECRET': 'xyz'}
+    enc = config.encrypt_config(data)
+    dec = config.decrypt_config(enc)
+    assert dec == data
+
+
+def test_update_and_backup(tmp_path, monkeypatch):
+    env = tmp_path / '.env'
+    env.write_text('API_KEY=foo\n')
+    backup_dir = tmp_path / 'backups'
+    backup_dir.mkdir()
+    monkeypatch.setattr(config, '_ENV_PATH', env)
+    monkeypatch.setattr(config, '_BACKUP_DIR', backup_dir)
+    monkeypatch.setattr(config, 'CONFIG', {'API_KEY': 'foo'})
+    import asyncio
+    asyncio.run(config.update_config('API_KEY', 'bar'))
+    assert 'API_KEY=bar' in env.read_text()
+    asyncio.run(config.backup_config())
+    assert any(backup_dir.iterdir())
+
+
+def test_backup_cleanup(tmp_path, monkeypatch):
+    env = tmp_path / '.env'
+    env.write_text('API_KEY=foo\n')
+    backup_dir = tmp_path / 'backups'
+    backup_dir.mkdir()
+    monkeypatch.setattr(config, '_ENV_PATH', env)
+    monkeypatch.setattr(config, '_BACKUP_DIR', backup_dir)
+    # allow many backups for first run, then restrict to 1 to test cleanup
+    monkeypatch.setattr(
+        config, 'CONFIG', {'BACKUP_RETENTION_DAYS': 365, 'MAX_BACKUPS': 10, 'API_KEY': 'foo'}
+    )
+    import asyncio
+    asyncio.run(config.backup_config())
+    assert any(backup_dir.glob('*.bak'))
+    config.CONFIG['MAX_BACKUPS'] = 1
+    asyncio.run(config.backup_config())
+    backups = list(backup_dir.glob('*.bak'))
+    assert len(backups) <= 1
+
+
+def test_cache_ttl_helpers(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {'CACHE_TTL_SECONDS': '42', 'TICKER_CACHE_TTL_SECONDS': '2.5'})
+    assert config.get_cache_ttl() == 42
+    assert config.get_ticker_cache_ttl() == 2.5
+
+
+def test_cache_size_helper(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {'CACHE_MAX_MB': '1'})
+    assert config.get_cache_max_bytes() == 1 * 1_048_576
+
+
+def test_memory_limit_helper(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {'MEMORY_MAX_MB': '2'})
+    assert config.get_memory_max_bytes() == 2 * 1_048_576
+
+
+def test_cache_notify_channels(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {'CACHE_NOTIFY_CHANNELS': 'email'})
+    assert config.get_cache_notify_channels() == 'email'
+
+
+def test_validate_config_cache_limit():
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'CACHE_MAX_MB': '10'
+    }
+    assert config.validate_config(good)
+
+    bad = good.copy()
+    bad['CACHE_MAX_MB'] = '0'
+    assert not config.validate_config(bad)
+
+
+def test_validate_config_memory_limit():
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'MEMORY_MAX_MB': '10'
+    }
+    assert config.validate_config(good)
+
+    bad = good.copy()
+    bad['MEMORY_MAX_MB'] = '0'
+    assert not config.validate_config(bad)
+
+
+def test_slippage_helpers(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        'CONFIG',
+        {'SPOT_SLIPPAGE': '0.002', 'FUTURES_SLIPPAGE': '0.003', 'MAX_BASIS_RISK': '0.02'},
+    )
+    assert config.get_spot_slippage() == 0.002
+    assert config.get_futures_slippage() == 0.003
+    assert config.get_max_basis_risk() == 0.02
+
+
+def test_validate_slippage_positive():
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'SPOT_SLIPPAGE': '0.001',
+        'FUTURES_SLIPPAGE': '0.001',
+        'MAX_BASIS_RISK': '0.05',
+    }
+    assert config.validate_config(good)
+    bad = good.copy()
+    bad['FUTURES_SLIPPAGE'] = '0'
+    assert not config.validate_config(bad)
+
+
+def test_indicator_param_helpers(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        'CONFIG',
+        {
+            'RSI_PERIOD': '21',
+            'MACD_FAST': '8',
+            'MACD_SLOW': '17',
+            'MACD_SIGNAL': '5',
+            'MA_WINDOW': '20',
+            'BOLL_WINDOW': '18',
+        },
+    )
+    assert config.get_rsi_period() == 21
+    assert config.get_macd_periods() == (8, 17, 5)
+    assert config.get_ma_window() == 20
+    assert config.get_boll_window() == 18
+
+
+def test_retry_delay_helpers(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {
+        'API_RETRY_BASE_DELAY': '1.5',
+        'API_RETRY_MAX_DELAY': '9'
+    })
+    assert config.get_retry_base_delay() == 1.5
+    assert config.get_retry_max_delay() == 9.0
+
+
+def test_validate_retry_delays():
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'API_RETRY_BASE_DELAY': '1',
+        'API_RETRY_MAX_DELAY': '5'
+    }
+    assert config.validate_config(good)
+    bad = good.copy()
+    bad['API_RETRY_BASE_DELAY'] = '-1'
+    assert not config.validate_config(bad)
+
+
+def test_validate_indicator_params():
+    base = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'RSI_PERIOD': '14'
+    }
+    assert config.validate_config(base)
+    bad = base.copy()
+    bad['MACD_FAST'] = '0'
+    assert not config.validate_config(bad)
+
+
+def test_switch_backup_timeout_helper(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {'SWITCH_BACKUP_TIMEOUT': '400'})
+    assert config.get_switch_backup_timeout() == 400
+
+
+def test_manual_outage_threshold_helper(monkeypatch):
+    monkeypatch.setattr(config, 'CONFIG', {'MANUAL_OUTAGE_THRESHOLD': '7200'})
+    assert config.get_manual_outage_threshold() == 7200
+
+
+def test_validate_switch_timeout():
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'SWITCH_BACKUP_TIMEOUT': '300'
+    }
+    assert config.validate_config(good)
+    bad = good.copy()
+    bad['SWITCH_BACKUP_TIMEOUT'] = '0'
+    assert not config.validate_config(bad)
+
+
+def test_validate_manual_outage_threshold(monkeypatch):
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'MANUAL_OUTAGE_THRESHOLD': '10'
+    }
+    assert config.validate_config(good)
+    bad = good.copy()
+    bad['MANUAL_OUTAGE_THRESHOLD'] = '0'
+    assert not config.validate_config(bad)
+
+
+def test_request_setting_helpers(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        'CONFIG',
+        {
+            'REQUEST_RETRIES': '4',
+            'REQUEST_RETRY_DELAY': '2.5',
+            'EXCHANGE_REQUEST_LIMIT': '7',
+        },
+    )
+    assert config.get_request_retries() == 4
+    assert config.get_request_retry_delay() == 2.5
+    assert config.get_exchange_request_limit() == 7
+
+
+def test_validate_request_settings():
+    good = {
+        'SPOT_PAIRS': "['BTC/USDT']",
+        'FUTURES_PAIRS': "['BTCUSDT']",
+        'BTC_USDT_BASIS_THRESHOLD_OPEN': '0.005',
+        'BTC_USDT_BASIS_THRESHOLD_CLOSE': '0.001',
+        'REQUEST_RETRIES': '2',
+        'REQUEST_RETRY_DELAY': '5',
+        'EXCHANGE_REQUEST_LIMIT': '5',
+    }
+    assert config.validate_config(good)
+    bad = good.copy()
+    bad['REQUEST_RETRIES'] = '0'
+    assert not config.validate_config(bad)

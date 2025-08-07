@@ -150,16 +150,12 @@ def _maybe_encrypt(message: str) -> str:
 
 
 def _log_shutdown() -> None:
-    """Record a final message when the application exits."""
-    try:
-        _logger.info("Logger shutting down")
-        for handler in _logger.handlers:
-            try:
-                handler.flush()
-            except Exception:
-                pass
-    except Exception:
-        pass
+    """Flush handlers quietly during interpreter shutdown."""
+    for handler in _logger.handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
 
 
 atexit.register(_log_shutdown)
@@ -173,7 +169,16 @@ async def _log_with_retry(func, msg: str, retries: int = 3) -> None:
     loop = asyncio.get_running_loop()
     for attempt in range(retries + 1):
         try:
-            await loop.run_in_executor(_EXECUTOR, func, msg)
+            def _write() -> None:
+                """Write message and flush all handlers."""
+                func(msg)
+                for handler in _logger.handlers:
+                    try:
+                        handler.flush()
+                    except Exception:
+                        pass
+
+            await loop.run_in_executor(_EXECUTOR, _write)
             return
         except Exception as exc:  # pragma: no cover - disk full or permission
             if attempt < retries:
@@ -211,7 +216,7 @@ def get_logger(name: str) -> logging.Logger:
 # ---------------------------------------------------------------------------
 # 1. setup_logger
 # ---------------------------------------------------------------------------
-def setup_logger(log_file: str = "bot.log") -> None:
+def setup_logger(log_file: str = "bot.log", level: int | str | None = None) -> None:
     """Configure logging to file and console.
 
     A ``RotatingFileHandler`` splits the main log into numbered pieces while a
@@ -223,12 +228,20 @@ def setup_logger(log_file: str = "bot.log") -> None:
     log_file:
         Where to store log messages.  The default is ``bot.log`` in the project
         root.
+    level:
+        Logging level as ``int`` or name like ``"DEBUG"``.  When ``None`` the
+        value is taken from the ``LOG_LEVEL`` environment variable and defaults
+        to ``INFO``.
     """
     global _LOG_FILE
     _LOG_FILE = Path(log_file)
     _LOG_FILE.touch(exist_ok=True)
 
-    _logger.setLevel(logging.DEBUG)
+    if level is None:
+        level = os.getenv("LOG_LEVEL", "INFO")
+    if isinstance(level, str):
+        level = getattr(logging, level.upper(), logging.INFO)
+    _logger.setLevel(level)
 
     # Clear existing handlers to avoid duplicate logs when reconfiguring.
     _logger.handlers.clear()

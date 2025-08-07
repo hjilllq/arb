@@ -4,6 +4,10 @@ This module is like an album where we glue tiny stickers for every price and
 trade.  Each function speaks in simple sentences so even a curious kid can read
 it.  Operations are asynchronous to keep our Apple Silicon M4 Max cool and
 energy‑frugal.
+
+Note that the maximum number of concurrent queries is determined when the
+module is imported.  Changing ``DB_QUERY_CONCURRENCY`` in ``.env`` during
+runtime requires a restart or module reload to take effect.
 """
 from __future__ import annotations
 
@@ -12,13 +16,20 @@ import os
 import shutil
 import gzip
 import random
-from concurrent.futures import ThreadPoolExecutor
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 
 import aiosqlite
 import pandas as pd
+
+try:  # pragma: no cover - config helper may not be present in tests
+    from config import load_config  # type: ignore
+except Exception:  # pragma: no cover - fallback to empty config
+    def load_config(*_args, **_kwargs):  # type: ignore
+        """Return empty config if real loader is missing."""
+        return {}
 
 # ---------------------------------------------------------------------------
 # Helper setup: logger and notifier. Real modules will be plugged in later.
@@ -48,13 +59,26 @@ except Exception:  # pragma: no cover - fallback
 # Global paths and connection holder
 # ---------------------------------------------------------------------------
 _DB_PATH = Path("data/trades.db")
-_DB_PATH.parent.mkdir(exist_ok=True)
 _BACKUP_DIR = Path("backups")
-_BACKUP_DIR.mkdir(exist_ok=True)
-_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 # Connection stored globally after :func:`connect_db` runs.
 _DB_CONN: Optional[aiosqlite.Connection] = None
+
+# Limit concurrent query connections so SQLite isn't overwhelmed.  The default
+# value of ``5`` can be overridden via the ``DB_QUERY_CONCURRENCY`` setting in
+# ``.env`` so operators can tune performance without touching the code.  The
+# semaphore is created at import time; adjusting the value at runtime requires a
+# process restart or module reload.
+_CONFIG = load_config()
+_QUERY_SEMAPHORE = asyncio.Semaphore(
+    int(_CONFIG.get("DB_QUERY_CONCURRENCY", 5))
+)
+
+# Regular expressions to verify symbol formats.
+_SPOT_RE = re.compile(r"^[A-Z0-9]+/[A-Z0-9]+$")
+# Futures tickers sometimes carry suffixes like ``-USDT`` or ``PERP``; the
+# pattern below allows an optional hyphenated part.
+_FUTURES_RE = re.compile(r"^[A-Z0-9]+(-?[A-Z0-9]+)?$")
 
 
 async def _get_conn() -> aiosqlite.Connection:
@@ -96,9 +120,27 @@ async def _ensure_schema(conn: aiosqlite.Connection) -> None:
             spot_bid REAL NOT NULL,
             futures_ask REAL NOT NULL,
             trade_qty REAL DEFAULT 0,
-            funding_rate REAL DEFAULT 0
-        )
+            funding_rate REAL DEFAULT 0,
+            UNIQUE(timestamp, spot_symbol, futures_symbol)
+        ) STRICT
         """
+    )
+    # ``IF NOT EXISTS`` won't add missing columns if the table already exists
+    # from an older schema.  We introspect and patch missing fields so queries
+    # referencing ``trade_qty`` or ``funding_rate`` don't crash with
+    # ``OperationalError: no such column``.
+    cur = await conn.execute("PRAGMA table_info(trades)")
+    info = await cur.fetchall()
+    cols = {row[1] for row in info}
+    if "trade_qty" not in cols:
+        await conn.execute("ALTER TABLE trades ADD COLUMN trade_qty REAL DEFAULT 0")
+    if "funding_rate" not in cols:
+        await conn.execute("ALTER TABLE trades ADD COLUMN funding_rate REAL DEFAULT 0")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pair_time ON trades(spot_symbol, futures_symbol, timestamp)"
+    )
+    await conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_pair_time ON trades(timestamp, spot_symbol, futures_symbol)"
     )
     await conn.commit()
 
@@ -147,6 +189,16 @@ def _cleanup_old_backups(limit: int = 20, max_age_days: int = 30, max_total_mb: 
     )
 
 
+async def checkpoint_wal() -> None:
+    """Truncate the Write-Ahead Log to keep it from growing forever."""
+    conn = await _get_conn()
+    try:
+        await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception as exc:  # pragma: no cover - rare failure
+        logger.error("WAL checkpoint failed: %s", exc)
+        await notify("Database WAL checkpoint failed", str(exc))
+
+
 # ---------------------------------------------------------------------------
 # 1. async connect_db
 # ---------------------------------------------------------------------------
@@ -158,6 +210,7 @@ async def connect_db(db_path: str = str(_DB_PATH), retries: int = 3) -> None:
     functions can reuse it.
     """
     global _DB_CONN
+    Path(db_path).parent.mkdir(exist_ok=True)
     delay = 0.1
     for attempt in range(1, retries + 1):
         try:
@@ -185,10 +238,9 @@ async def save_data(data: List[Dict[str, Any]]) -> None:
     """Store a list of price or trade entries into the database.
 
     Each dictionary is checked with :func:`validate_data` before insertion.
-    Example item::
-
-        {'timestamp': '2025-08-05T00:00:00', 'spot_symbol': 'BTC/USDT',
-         'futures_symbol': 'BTCUSDT', 'spot_bid': 59990, 'futures_ask': 60000}
+    To keep every batch either fully written or fully discarded we explicitly
+    start a transaction (``BEGIN IMMEDIATE``).  If anything goes wrong we roll
+    back so no half-complete rows linger.
     """
     if not validate_data(data):
         return
@@ -196,6 +248,7 @@ async def save_data(data: List[Dict[str, Any]]) -> None:
     for attempt in range(1, 4):
         conn = await _get_conn()
         try:
+            await conn.execute("BEGIN IMMEDIATE")
             await conn.executemany(
                 """
                 INSERT INTO trades (
@@ -204,6 +257,11 @@ async def save_data(data: List[Dict[str, Any]]) -> None:
                 ) VALUES (:timestamp, :spot_symbol, :futures_symbol,
                           :spot_bid, :futures_ask,
                           :trade_qty, :funding_rate)
+                ON CONFLICT(timestamp, spot_symbol, futures_symbol) DO UPDATE SET
+                    spot_bid=excluded.spot_bid,
+                    futures_ask=excluded.futures_ask,
+                    trade_qty=excluded.trade_qty,
+                    funding_rate=excluded.funding_rate
                 """,
                 [
                     {
@@ -222,6 +280,10 @@ async def save_data(data: List[Dict[str, Any]]) -> None:
             logger.info("Saved %d rows", len(data))
             return
         except Exception as exc:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
             logger.error("Failed to save data (attempt %d/3): %s", attempt, exc)
             if attempt == 3:
                 try:
@@ -247,13 +309,17 @@ async def query_data(
     max_funding: Optional[float] = None,
     parallel: bool = False,
     chunk_days: int = 30,
-) -> List[Dict[str, Any]]:
+    max_concurrency: Optional[int] = None,
+    as_dataframe: bool = False,
+) -> Union[List[Dict[str, Any]], pd.DataFrame]:
     """Return records for a pair between two dates.
 
     Optional filters narrow results by quantity and funding rate.  Setting
     ``parallel=True`` splits the date range into ``chunk_days`` segments and
-    queries them concurrently using separate connections.  This speeds up large
-    reads when the table grows big.
+    queries them concurrently using separate connections.  ``max_concurrency``
+    limits how many of those chunks run at once so SQLite isn't overwhelmed.
+    This speeds up large reads when the table grows big while keeping resource
+    usage in check.
     """
 
     base_query = (
@@ -285,22 +351,25 @@ async def query_data(
     if max_funding is not None:
         filter_clause += " AND funding_rate <= ?"
 
+    sem = _QUERY_SEMAPHORE if max_concurrency is None else asyncio.Semaphore(max_concurrency)
+
     async def _run_chunk(start: str, end: str) -> List[Dict[str, Any]]:
-        try:
-            async with aiosqlite.connect(str(_DB_PATH)) as conn:
-                query = base_query + filter_clause + " ORDER BY timestamp"
-                cursor = await conn.execute(query, _build_params(start, end))
-                rows = await cursor.fetchall()
-                cols = [c[0] for c in cursor.description]
-                df = pd.DataFrame(rows, columns=cols)
-                return df.to_dict("records")
-        except Exception as exc:
-            logger.error("Parallel query chunk failed: %s", exc)
+        async with sem:
             try:
-                await notify("Database query failed", str(exc))
-            except Exception:
-                pass
-            return []
+                async with aiosqlite.connect(str(_DB_PATH)) as conn:
+                    query = base_query + filter_clause + " ORDER BY timestamp"
+                    cursor = await conn.execute(query, _build_params(start, end))
+                    rows = await cursor.fetchall()
+                    cols = [c[0] for c in cursor.description]
+                    df = pd.DataFrame(rows, columns=cols)
+                    return df if as_dataframe else df.to_dict("records")
+            except Exception as exc:
+                logger.error("Parallel query chunk failed: %s", exc)
+                try:
+                    await notify("Database query failed", str(exc))
+                except Exception:
+                    pass
+                return []
 
     if not parallel:
         conn = await _get_conn()
@@ -310,7 +379,7 @@ async def query_data(
             rows = await cursor.fetchall()
             cols = [c[0] for c in cursor.description]
             df = pd.DataFrame(rows, columns=cols)
-            return df.to_dict("records")
+            return df if as_dataframe else df.to_dict("records")
         except Exception as exc:
             logger.error("Query failed: %s", exc)
             try:
@@ -342,6 +411,8 @@ async def query_data(
             except Exception:
                 pass
     results.sort(key=lambda x: x["timestamp"])
+    if as_dataframe:
+        return pd.DataFrame(results)
     return results
 
 
@@ -352,8 +423,10 @@ async def backup_database(compress: bool = True) -> None:
     """Create a timestamped backup copy of the database file.
 
     The file is optionally compressed with gzip to save space, and we log its
-    size before copying to avoid surprises.
+    size before copying to avoid surprises.  The destination directory is
+    created lazily to avoid unnecessary I/O during imports.
     """
+    _BACKUP_DIR.mkdir(exist_ok=True)
     if not _DB_PATH.exists():
         logger.error("Cannot backup: database missing at %s", _DB_PATH)
         await notify("Database backup failed", "missing db file")
@@ -362,24 +435,65 @@ async def backup_database(compress: bool = True) -> None:
     logger.info("Database size %.2f MB", size_mb)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     backup_file = _BACKUP_DIR / f"trades.db.{timestamp}.bak"
-    loop = asyncio.get_running_loop()
 
-    def _copy(src: Path, dst: Path) -> None:
-        if compress:
+    def _copy(src: Path, dst: Path, do_compress: bool) -> None:
+        """Run the expensive file copy in a background thread.
+
+        For very large databases (>200 MB) we stream the file in small chunks
+        and log progress roughly every 50 MB so operators can see that the
+        backup is still moving along."""
+        size = src.stat().st_size
+        if do_compress:
             with open(src, "rb") as fsrc, gzip.open(dst, "wb") as fdst:
-                shutil.copyfileobj(fsrc, fdst)
+                if size > 200 * 1_048_576:
+                    copied = 0
+                    step = 50 * 1_048_576
+                    while True:
+                        chunk = fsrc.read(1_048_576)
+                        if not chunk:
+                            break
+                        fdst.write(chunk)
+                        copied += len(chunk)
+                        if copied // step > (copied - len(chunk)) // step:
+                            logger.info(
+                                "Backup progress: %.0f%%", copied / size * 100
+                            )
+                else:
+                    shutil.copyfileobj(fsrc, fdst)
         else:
             shutil.copy2(src, dst)
 
     try:
         if compress:
             backup_file = backup_file.with_suffix(backup_file.suffix + ".gz")
-        await loop.run_in_executor(_EXECUTOR, _copy, _DB_PATH, backup_file)
+        await asyncio.to_thread(_copy, _DB_PATH, backup_file, compress)
         logger.info("Database backup created at %s", backup_file)
-        await loop.run_in_executor(_EXECUTOR, _cleanup_old_backups)
+        await asyncio.to_thread(_cleanup_old_backups)
+        await checkpoint_wal()
     except Exception as exc:
         logger.error("Database backup failed: %s", exc)
         await notify("Database backup failed", str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 4b. async vacuum_db
+# ---------------------------------------------------------------------------
+async def vacuum_db() -> None:
+    """Compact the database file by running ``VACUUM``.
+
+    While WAL mode already keeps the database stable, an occasional VACUUM
+    reclaims disk space after massive deletes.  It is safe to run while no
+    other transactions are active and typically only needed during
+    maintenance windows.
+    """
+    conn = await _get_conn()
+    try:
+        await conn.execute("VACUUM")
+        await conn.commit()
+        logger.info("Database vacuum completed")
+    except Exception as exc:  # pragma: no cover - rare
+        logger.error("Database vacuum failed: %s", exc)
+        await notify("Database vacuum failed", str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +534,8 @@ def validate_data(data: Iterable[Dict[str, Any]]) -> bool:
                 raise ValueError(f"missing keys: {required - set(item)}")
             if float(item["spot_bid"]) <= 0 or float(item["futures_ask"]) <= 0:
                 raise ValueError("prices must be positive")
+            if not (_SPOT_RE.match(str(item["spot_symbol"])) and _FUTURES_RE.match(str(item["futures_symbol"]))):
+                raise ValueError("bad symbol format")
     except Exception as exc:
         logger.error("Invalid data: %s", exc)
         try:

@@ -1,0 +1,34 @@
+aiofiles==24.1.0
+aiohttp==3.12.15
+aiosqlite==0.21.0
+ccxt==4.4.99
+cryptography==45.0.6
+numpy==2.3.2
+pandas==2.3.1
+prometheus-client==0.22.1
+psutil==7.0.0
+python-dotenv==1.1.1
+schedule==1.2.2
+ta==0.11.0
+tensorflow==2.19.0
+tensorflow-metal==1.2.0
+pytest==8.4.1
+pytest-asyncio==1.1.0
+
+# Notes for Apple Silicon M4 Max (macOS Tahoe, Python 3.13.5)
+# aiofiles==24.1.0 - pure Python; runs natively on ARM with no known issues.
+# aiohttp==3.12.15 - universal wheels; prebuilt binaries work on macOS Tahoe, builds require Clang.
+# aiosqlite==0.21.0 - pure Python wrapper over SQLite; no Apple Silicon issues.
+# ccxt==4.4.99 - pure Python exchange client; asyncio performance depends on event loop efficiency.
+# cryptography==45.0.6 - ships with Rust-backed universal wheels; ensure up-to-date pip to avoid compiling.
+# numpy==2.3.2 - universal2 wheels use Accelerate; best performance when Apple BLAS is available.
+# pandas==2.3.1 - depends on numpy; heavy operations are optimized for ARM via universal wheels.
+# prometheus-client==0.22.1 - pure Python metrics library; works out of the box on Apple Silicon.
+# psutil==7.0.0 - macOS wheels include ARM support; building from source requires Xcode tools.
+# python-dotenv==1.1.1 - pure Python; no platform-specific concerns.
+# schedule==1.2.2 - pure Python task scheduler; low overhead on ARM cores.
+# ta==0.11.0 - built atop pandas/numpy; no additional platform issues.
+# tensorflow==2.19.0 - requires compatible universal2 wheel; pair with tensorflow-metal for GPU acceleration.
+# tensorflow-metal==1.2.0 - integrates with Apple Metal; supports only Apple Silicon on recent macOS.
+# pytest==8.4.1 - pure Python testing framework; works on Python 3.13.5 without modification.
+# pytest-asyncio==1.1.0 - extends pytest for asyncio tests; no Apple Silicon-specific problems.

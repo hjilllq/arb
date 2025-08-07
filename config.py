@@ -13,7 +13,10 @@ import asyncio
 import json
 import os
 import re
+import shutil
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from itertools import chain
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -76,56 +79,99 @@ _CIPHER = Fernet(_FERNET_KEY)
 # This global cache will hold the latest configuration after load_config runs.
 CONFIG: Dict[str, Any] = {}
 
+# Executor for tiny background file tasks like backups.
+_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
+# Cache for threshold JSON files to avoid repeated disk reads when config is
+# reloaded frequently.
+_THRESHOLDS_CACHE: Dict[Path, tuple[float, Dict[str, Any]]] = {}
+
+
+class ConfigError(RuntimeError):
+    """Raised when configuration cannot be loaded or is invalid."""
+
 
 # ---------------------------------------------------------------------------
 # 1. load_config                                                             
 # ---------------------------------------------------------------------------
-def load_config(file_path: str = ".env") -> Dict[str, str]:
-    """Read a ``.env`` file and return a dictionary of settings.
+def load_config(file_path: str = ".env", *, reload: bool = False) -> Dict[str, str]:
+    """Read configuration from ``.env`` and optional JSON helpers.
 
-    It is like opening a lunchbox to see every snack inside.  Reading is done
-    with :func:`dotenv_values` to minimise disk chatter.  If the ``.env`` file
-    is missing we peek at environment variables instead of giving up.
+    The first call fills the global :data:`CONFIG` cache so repeated access is
+    fast.  Set ``reload=True`` to re-read the file.
 
     Parameters
     ----------
     file_path:
-        Where the ``.env`` file lives.  Defaults to ``".env"`` next to this
-        module.
+        Path to the ``.env`` file.
+    reload:
+        Force re-reading the file even if we already have a cached copy.
 
     Returns
     -------
     dict
-        Mapping of names to values, e.g. ``{"API_KEY": "abc"}``.  Environment
-        variables are used as a fallback when the file is missing.
-
-    Examples
-    --------
-    >>> config = load_config()
-    >>> config.get("API_KEY")  # doctest: +SKIP
-    'FSE8dMTTSC6qgLbfOs'
+        Mapping of names to values.  Keys loaded from JSON helpers are stored as
+        strings for consistency.
     """
+
+    if CONFIG and not reload and Path(file_path) == _ENV_PATH:
+        return CONFIG
+
     env_path = Path(file_path)
-    if not env_path.exists():
-        logger.warning("Config file %s is missing. Using default values.", file_path)
+    try:
+        if env_path.exists():
+            config = dotenv_values(env_path)
+            logger.info("Config loaded from %s", file_path)
+        else:
+            logger.warning("Config file %s is missing. Using environment only.", file_path)
+            try:
+                asyncio.run(notify("Config file missing", file_path))
+            except RuntimeError:
+                pass
+            config = dotenv_values()
+            if not config:
+                config = dict(os.environ)
+        if not config:
+            raise ConfigError("No configuration found")
+    except OSError as exc:
+        logger.error("Config read error: %s", exc)
         try:
-            asyncio.run(notify("Config file missing", file_path))
-        except RuntimeError:  # event loop already running
+            asyncio.run(notify("Config read error", str(exc)))
+        except RuntimeError:
             pass
-        config = dotenv_values()
-        if config:
-            logger.info("Config loaded from environment variables")
-            return config
-        env_config = dict(os.environ)
-        if env_config:
-            logger.info("Config loaded from OS environment variables")
-            return env_config
-        logger.critical(
-            "No configuration found. Please define environment variables or .env file."
-        )
-        raise ValueError("Configuration missing")
-    config = dotenv_values(env_path)
-    logger.info("Config loaded from %s", file_path)
+        raise ConfigError(str(exc)) from exc
+
+    thresholds_file = config.get("THRESHOLDS_FILE")
+    if thresholds_file:
+        # Extra thresholds can live in a neat JSON file.  It keeps the main
+        # ``.env`` short and easy to read while still letting an operator tweak
+        # numbers on the fly.  When the file is used repeatedly we keep a small
+        # in-memory cache keyed by file path and modification time so we do not
+        # hit the disk over and over again.
+        t_path = Path(thresholds_file)
+        if not t_path.is_absolute():
+            t_path = env_path.parent / t_path
+        try:
+            mtime = t_path.stat().st_mtime
+            cached = _THRESHOLDS_CACHE.get(t_path)
+            if cached and cached[0] == mtime:
+                extra = cached[1]
+            else:
+                extra = json.loads(t_path.read_text())
+                _THRESHOLDS_CACHE[t_path] = (mtime, extra)
+        except Exception as exc:
+            logger.error("Threshold file error %s: %s", t_path, exc)
+            try:
+                asyncio.run(notify("Threshold file error", f"{t_path}: {exc}"))
+            except RuntimeError:
+                pass
+        else:
+            config.update({k: str(v) for k, v in extra.items()})
+            logger.info("Extra thresholds merged from %s", t_path)
+
+    if Path(file_path) == _ENV_PATH:
+        CONFIG.clear()
+        CONFIG.update(config)
     return config
 
 
@@ -177,6 +223,8 @@ def validate_config(config: Dict[str, Any]) -> bool:
                 raise ValueError(f"invalid spot pair format: {s_pair}")
             if not fut_re.match(f_pair):
                 raise ValueError(f"invalid futures pair format: {f_pair}")
+            if s_pair.replace("/", "") != f_pair.replace("-", ""):
+                raise ValueError(f"spot/futures mismatch: {s_pair} vs {f_pair}")
 
             base = s_pair.replace("/", "_")
             open_key = f"{base}_BASIS_THRESHOLD_OPEN"
@@ -203,6 +251,91 @@ def validate_config(config: Dict[str, Any]) -> bool:
         config["PAIR_TTL_MIN"] = ttl_min
         config["PAIR_TTL_MAX"] = ttl_max
         config["PAIR_TTL_STEP"] = ttl_step
+
+        # Optional cache TTLs for Bybit API helpers
+        if "CACHE_TTL_SECONDS" in config:
+            ttl = int(config["CACHE_TTL_SECONDS"])
+            if ttl <= 0:
+                raise ValueError("CACHE_TTL_SECONDS must be positive")
+            config["CACHE_TTL_SECONDS"] = ttl
+        if "TICKER_CACHE_TTL_SECONDS" in config:
+            tttl = float(config["TICKER_CACHE_TTL_SECONDS"])
+            if tttl <= 0:
+                raise ValueError("TICKER_CACHE_TTL_SECONDS must be positive")
+            config["TICKER_CACHE_TTL_SECONDS"] = tttl
+
+        if "CACHE_MAX_MB" in config:
+            max_mb = int(config["CACHE_MAX_MB"])
+            if max_mb <= 0:
+                raise ValueError("CACHE_MAX_MB must be positive")
+            config["CACHE_MAX_MB"] = max_mb
+
+        if "MEMORY_MAX_MB" in config:
+            mem_mb = int(config["MEMORY_MAX_MB"])
+            if mem_mb <= 0:
+                raise ValueError("MEMORY_MAX_MB must be positive")
+            config["MEMORY_MAX_MB"] = mem_mb
+
+        # Optional slippage and risk settings
+        for key in ("SPOT_SLIPPAGE", "FUTURES_SLIPPAGE", "MAX_BASIS_RISK"):
+            if key in config:
+                val = float(config[key])
+                if val <= 0:
+                    raise ValueError(f"{key} must be positive")
+                config[key] = val
+
+        # Optional indicator parameters
+        for key in (
+            "RSI_PERIOD",
+            "MACD_FAST",
+            "MACD_SLOW",
+            "MACD_SIGNAL",
+            "MA_WINDOW",
+            "BOLL_WINDOW",
+        ):
+            if key in config:
+                val = int(config[key])
+                if val <= 0:
+                    raise ValueError(f"{key} must be positive")
+                config[key] = val
+
+        # Optional retry delay settings for Bybit API helpers
+        if "API_RETRY_BASE_DELAY" in config or "API_RETRY_MAX_DELAY" in config:
+            base = float(config.get("API_RETRY_BASE_DELAY", 5))
+            mx = float(config.get("API_RETRY_MAX_DELAY", 60))
+            if base <= 0 or mx <= 0 or base > mx:
+                raise ValueError("API retry delays must be positive and base <= max")
+            config["API_RETRY_BASE_DELAY"] = base
+            config["API_RETRY_MAX_DELAY"] = mx
+
+        if "SWITCH_BACKUP_TIMEOUT" in config:
+            timeout = int(config["SWITCH_BACKUP_TIMEOUT"])
+            if timeout <= 0:
+                raise ValueError("SWITCH_BACKUP_TIMEOUT must be positive")
+            config["SWITCH_BACKUP_TIMEOUT"] = timeout
+
+        if "MANUAL_OUTAGE_THRESHOLD" in config:
+            mot = int(config["MANUAL_OUTAGE_THRESHOLD"])
+            if mot <= 0:
+                raise ValueError("MANUAL_OUTAGE_THRESHOLD must be positive")
+            config["MANUAL_OUTAGE_THRESHOLD"] = mot
+
+        # Optional request and retry settings for exchange_manager
+        if "REQUEST_RETRIES" in config:
+            retries = int(config["REQUEST_RETRIES"])
+            if retries <= 0:
+                raise ValueError("REQUEST_RETRIES must be positive")
+            config["REQUEST_RETRIES"] = retries
+        if "REQUEST_RETRY_DELAY" in config:
+            delay = float(config["REQUEST_RETRY_DELAY"])
+            if delay <= 0:
+                raise ValueError("REQUEST_RETRY_DELAY must be positive")
+            config["REQUEST_RETRY_DELAY"] = delay
+        if "EXCHANGE_REQUEST_LIMIT" in config:
+            limit = int(config["EXCHANGE_REQUEST_LIMIT"])
+            if limit <= 0:
+                raise ValueError("EXCHANGE_REQUEST_LIMIT must be positive")
+            config["EXCHANGE_REQUEST_LIMIT"] = limit
     except Exception as exc:  # broad to keep example child friendly
         logger.error("Validation failed: %s", exc)
         try:
@@ -327,7 +460,7 @@ def get_pair_mapping() -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# 8. get_pair_thresholds                                                     
+# 8. get_pair_thresholds
 # ---------------------------------------------------------------------------
 def get_pair_thresholds(symbol: str) -> Dict[str, float]:
     """Fetch open/close basis thresholds for a given spot pair.
@@ -366,7 +499,270 @@ def get_pair_thresholds(symbol: str) -> Dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# 9. update_config                                                           
+# 9. get_cache_ttl
+# ---------------------------------------------------------------------------
+def get_cache_ttl() -> int:
+    """Return how long, in seconds, disk cache files remain fresh.
+
+    Example
+    -------
+    >>> CONFIG['CACHE_TTL_SECONDS'] = '60'
+    >>> get_cache_ttl()
+    60
+    """
+    cfg = load_config()
+    try:
+        ttl = int(cfg.get("CACHE_TTL_SECONDS", 86_400))
+    except ValueError:
+        ttl = 86_400
+    return max(ttl, 0)
+
+
+# ---------------------------------------------------------------------------
+# 10. get_ticker_cache_ttl
+# ---------------------------------------------------------------------------
+def get_ticker_cache_ttl() -> float:
+    """Return how long the in-memory ticker cache stays valid."""
+    cfg = load_config()
+    try:
+        ttl = float(cfg.get("TICKER_CACHE_TTL_SECONDS", 1.0))
+    except ValueError:
+        ttl = 1.0
+    return max(ttl, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 11. get_spot_slippage / get_futures_slippage / get_max_basis_risk
+# ---------------------------------------------------------------------------
+def get_spot_slippage() -> float:
+    """Return estimated slippage for spot trades as a fraction."""
+    cfg = load_config()
+    try:
+        val = float(cfg.get("SPOT_SLIPPAGE", 0.001))
+    except ValueError:
+        val = 0.001
+    return max(val, 0.0)
+
+
+def get_futures_slippage() -> float:
+    """Return estimated slippage for futures trades as a fraction."""
+    cfg = load_config()
+    try:
+        val = float(cfg.get("FUTURES_SLIPPAGE", 0.001))
+    except ValueError:
+        val = 0.001
+    return max(val, 0.0)
+
+
+def get_max_basis_risk() -> float:
+    """Return the maximum tolerated basis before trades are paused."""
+    cfg = load_config()
+    try:
+        val = float(cfg.get("MAX_BASIS_RISK", 0.05))
+    except ValueError:
+        val = 0.05
+    return max(val, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 11a. Indicator parameter helpers
+# ---------------------------------------------------------------------------
+def get_rsi_period() -> int:
+    """Return the window size for RSI calculations.
+
+    The default of ``14`` matches common trading literature.  Values are
+    coerced to at least ``1`` so callers never receive a nonsense period.
+    """
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("RSI_PERIOD", 14))
+    except ValueError:
+        val = 14
+    return max(val, 1)
+
+
+def get_macd_periods() -> tuple[int, int, int]:
+    """Return ``(fast, slow, signal)`` periods for MACD calculations."""
+
+    cfg = load_config()
+
+    def _get(name: str, default: int) -> int:
+        try:
+            val = int(cfg.get(name, default))
+        except ValueError:
+            val = default
+        return max(val, 1)
+
+    fast = _get("MACD_FAST", 12)
+    slow = _get("MACD_SLOW", 26)
+    signal = _get("MACD_SIGNAL", 9)
+    return fast, slow, signal
+
+
+def get_ma_window() -> int:
+    """Return the window size for moving average indicators."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("MA_WINDOW", 5))
+    except ValueError:
+        val = 5
+    return max(val, 1)
+
+
+def get_boll_window() -> int:
+    """Return the window size for Bollinger bands."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("BOLL_WINDOW", 5))
+    except ValueError:
+        val = 5
+    return max(val, 1)
+
+
+# ---------------------------------------------------------------------------
+# 11b. get_cache_max_bytes
+# ---------------------------------------------------------------------------
+def get_cache_max_bytes() -> int:
+    """Return the maximum cache directory size in bytes.
+
+    Example
+    -------
+    >>> CONFIG['CACHE_MAX_MB'] = '1'
+    >>> get_cache_max_bytes()
+    1048576
+    """
+    cfg = load_config()
+    try:
+        mb = int(cfg.get("CACHE_MAX_MB", 50))
+    except ValueError:
+        mb = 50
+    return max(mb, 0) * 1_048_576
+
+
+# ---------------------------------------------------------------------------
+# 11c. get_memory_max_bytes
+# ---------------------------------------------------------------------------
+def get_memory_max_bytes() -> int:
+    """Return the memory usage limit in bytes.
+
+    Example
+    -------
+    >>> CONFIG['MEMORY_MAX_MB'] = '2'
+    >>> get_memory_max_bytes()
+    2097152
+    """
+    cfg = load_config()
+    try:
+        mb = int(cfg.get("MEMORY_MAX_MB", 0))
+    except ValueError:
+        mb = 0
+    return max(mb, 0) * 1_048_576
+
+
+# ---------------------------------------------------------------------------
+# 11d. get_cache_notify_channels
+# ---------------------------------------------------------------------------
+def get_cache_notify_channels() -> str:
+    """Return comma-separated channels for cache alerts."""
+    cfg = load_config()
+    return str(cfg.get("CACHE_NOTIFY_CHANNELS", "")).strip()
+
+
+# ---------------------------------------------------------------------------
+# 12. get_retry_base_delay
+# ---------------------------------------------------------------------------
+def get_retry_base_delay() -> float:
+    """Return the base delay used for API retry backoff."""
+    cfg = load_config()
+    try:
+        base = float(cfg.get("API_RETRY_BASE_DELAY", 5.0))
+    except ValueError:
+        base = 5.0
+    return max(base, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 13. get_retry_max_delay
+# ---------------------------------------------------------------------------
+def get_retry_max_delay() -> float:
+    """Return the maximum delay between API retries."""
+    cfg = load_config()
+    try:
+        mx = float(cfg.get("API_RETRY_MAX_DELAY", 60.0))
+    except ValueError:
+        mx = 60.0
+    return max(mx, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 13a. get_switch_backup_timeout
+# ---------------------------------------------------------------------------
+def get_switch_backup_timeout() -> int:
+    """Return seconds to wait before switching to the backup exchange."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("SWITCH_BACKUP_TIMEOUT", 300))
+    except ValueError:
+        val = 300
+    return max(val, 0)
+
+
+# ---------------------------------------------------------------------------
+# 13b. get_manual_outage_threshold
+# ---------------------------------------------------------------------------
+def get_manual_outage_threshold() -> int:
+    """Return seconds of downtime after which manual intervention is required."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("MANUAL_OUTAGE_THRESHOLD", 21600))
+    except ValueError:
+        val = 21600
+    return max(val, 0)
+
+
+# ---------------------------------------------------------------------------
+# 13c. request/retry helpers
+# ---------------------------------------------------------------------------
+def get_request_retries() -> int:
+    """Return how many times API calls should be retried."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("REQUEST_RETRIES", 3))
+    except ValueError:
+        val = 3
+    return max(val, 0)
+
+
+def get_request_retry_delay() -> float:
+    """Return seconds to wait between retry attempts."""
+
+    cfg = load_config()
+    try:
+        val = float(cfg.get("REQUEST_RETRY_DELAY", 5.0))
+    except ValueError:
+        val = 5.0
+    return max(val, 0.0)
+
+
+def get_exchange_request_limit() -> int:
+    """Return the concurrent request cap per exchange."""
+
+    cfg = load_config()
+    try:
+        val = int(cfg.get("EXCHANGE_REQUEST_LIMIT", 5))
+    except ValueError:
+        val = 5
+    return max(val, 1)
+
+
+# ---------------------------------------------------------------------------
+# 14. update_config
 # ---------------------------------------------------------------------------
 async def update_config(key: str, value: Any) -> None:
     """Asynchronously update a single configuration value.
@@ -385,35 +781,48 @@ async def update_config(key: str, value: Any) -> None:
     --------
     >>> asyncio.run(update_config('MAX_DAILY_LOSS', 0.1))  # doctest: +SKIP
     """
+    if CONFIG.get(key) == value:
+        logger.debug("Config for %s unchanged; skipping disk write", key)
+        return
     CONFIG[key] = value
 
     lines: List[str] = []
     if _ENV_PATH.exists():
-        async with aiofiles.open(_ENV_PATH, mode="r", encoding="utf-8") as f:
-            lines = await f.readlines()
+        try:
+            async with aiofiles.open(_ENV_PATH, mode="r", encoding="utf-8") as f:
+                lines = await f.readlines()
+        except OSError as exc:
+            logger.error("Config read failed: %s", exc)
+            await notify("Config update failed", str(exc))
+            raise
     line_written = False
-    async with aiofiles.open(_ENV_PATH, mode="w", encoding="utf-8") as f:
-        for line in lines:
-            if line.startswith(f"{key}="):
+    try:
+        async with aiofiles.open(_ENV_PATH, mode="w", encoding="utf-8") as f:
+            for line in lines:
+                if line.startswith(f"{key}="):
+                    await f.write(f"{key}={value}\n")
+                    line_written = True
+                else:
+                    await f.write(line)
+            if not line_written:
                 await f.write(f"{key}={value}\n")
-                line_written = True
-            else:
-                await f.write(line)
-        if not line_written:
-            await f.write(f"{key}={value}\n")
+    except OSError as exc:
+        logger.error("Config write failed: %s", exc)
+        await notify("Config update failed", str(exc))
+        raise
     logger.info("Updated %s in config", key)
 
 
 # ---------------------------------------------------------------------------
-# 10. backup_config                                                          
+# 15. backup_config
 # ---------------------------------------------------------------------------
 async def backup_config() -> None:
-    """Create a timestamped copy of the ``.env`` file asynchronously.
+    """Create a timestamped copy of ``.env`` using a background thread.
 
-    The backup sits in ``backups/`` like a photograph of our settings, so we
-    can always look back if something goes wrong.  Old backups are cleaned
-    based on ``BACKUP_RETENTION_DAYS`` (default ``30``) and ``MAX_BACKUPS``
-    from the configuration.
+    The work is handed to :class:`ThreadPoolExecutor` so the main loop stays
+    snappy even on a busy little M4 chip.  Old backups are trimmed by age and
+    count based on ``BACKUP_RETENTION_DAYS`` and ``MAX_BACKUPS`` in the
+    configuration.
 
     Examples
     --------
@@ -423,34 +832,45 @@ async def backup_config() -> None:
         logger.error("Cannot backup: %s does not exist", _ENV_PATH)
         await notify("Backup failed", ".env missing")
         return
+
+    loop = asyncio.get_running_loop()
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     backup_file = _BACKUP_DIR / f".env.{timestamp}.bak"
-    async with aiofiles.open(_ENV_PATH, mode="rb") as fsrc:
-        data = await fsrc.read()
-    async with aiofiles.open(backup_file, mode="wb") as fdst:
-        await fdst.write(data)
+
+    try:
+        await loop.run_in_executor(_EXECUTOR, shutil.copy2, _ENV_PATH, backup_file)
+    except OSError as exc:
+        logger.error("Backup copy failed: %s", exc)
+        await notify("Backup failed", str(exc))
+        return
     logger.info("Backup created: %s", backup_file)
 
     retention_days = int(CONFIG.get("BACKUP_RETENTION_DAYS", 30))
     max_backups = int(CONFIG.get("MAX_BACKUPS", 0))  # 0 means unlimited
-
     cutoff = datetime.utcnow().timestamp() - retention_days * 24 * 3600
-    backups = sorted(_BACKUP_DIR.glob("*.bak"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for bk in backups:
-        try:
-            if bk.stat().st_mtime < cutoff:
-                bk.unlink()
-                logger.info("Old backup removed: %s", bk)
-        except OSError:  # pragma: no cover - rare file system issue
-            logger.warning("Failed to inspect/delete backup: %s", bk)
 
-    if max_backups and len(backups) > max_backups:
-        for bk in backups[max_backups:]:
+    def _cleanup() -> None:
+        backups = sorted(
+            chain(_BACKUP_DIR.glob("*.bak"), _BACKUP_DIR.glob(".*.bak")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for bk in backups:
             try:
-                bk.unlink()
-                logger.info("Excess backup removed: %s", bk)
+                if bk.stat().st_mtime < cutoff:
+                    bk.unlink()
+                    logger.info("Old backup removed: %s", bk)
             except OSError:  # pragma: no cover - rare file system issue
-                logger.warning("Failed to remove backup: %s", bk)
+                logger.warning("Failed to inspect/delete backup: %s", bk)
+        if max_backups and len(backups) > max_backups:
+            for bk in backups[max_backups:]:
+                try:
+                    bk.unlink()
+                    logger.info("Excess backup removed: %s", bk)
+                except OSError:  # pragma: no cover - rare file system issue
+                    logger.warning("Failed to remove backup: %s", bk)
+
+    await loop.run_in_executor(_EXECUTOR, _cleanup)
 
 
 # ---------------------------------------------------------------------------
