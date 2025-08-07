@@ -150,9 +150,8 @@ def _maybe_encrypt(message: str) -> str:
 
 
 def _log_shutdown() -> None:
-    """Record a final message when the application exits."""
+    """Flush handlers on shutdown without emitting new log records."""
     try:
-        _logger.info("Logger shutting down")
         for handler in _logger.handlers:
             try:
                 handler.flush()

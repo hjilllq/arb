@@ -45,6 +45,22 @@ except Exception:  # pragma: no cover - fallback
         logger.warning("Notification: %s - %s", message, detail)
 
 
+def notify_sync(message: str, detail: str = "") -> None:
+    """Synchronously schedule :func:`notify` regardless of loop state.
+
+    If an event loop is already running we simply create a task for
+    :func:`notify`.  Otherwise :func:`asyncio.run` is used to execute it in a
+    fresh loop.  This helper removes the repetitive boilerplate scattered
+    through the module.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(notify(message, detail))
+    else:
+        loop.create_task(notify(message, detail))
+
+
 # ---------------------------------------------------------------------------
 # Constants shared across the module.                                         
 # ---------------------------------------------------------------------------
@@ -108,10 +124,7 @@ def load_config(file_path: str = ".env") -> Dict[str, str]:
     env_path = Path(file_path)
     if not env_path.exists():
         logger.warning("Config file %s is missing. Using default values.", file_path)
-        try:
-            asyncio.run(notify("Config file missing", file_path))
-        except RuntimeError:  # event loop already running
-            pass
+        notify_sync("Config file missing", file_path)
         config = dotenv_values()
         if config:
             logger.info("Config loaded from environment variables")
@@ -190,7 +203,7 @@ def validate_config(config: Dict[str, Any]) -> bool:
                     f"thresholds for {s_pair} must be > 0, got open={open_val}, close={close_val}"
                 )
 
-        # Optional TTL settings for exchange_manager caching
+        # Optional TTL settings for pair caching
         ttl_min = int(config.get("PAIR_TTL_MIN", 60))
         ttl_max = int(config.get("PAIR_TTL_MAX", 900))
         ttl_step = int(config.get("PAIR_TTL_STEP", 60))
@@ -203,12 +216,16 @@ def validate_config(config: Dict[str, Any]) -> bool:
         config["PAIR_TTL_MIN"] = ttl_min
         config["PAIR_TTL_MAX"] = ttl_max
         config["PAIR_TTL_STEP"] = ttl_step
+
+        # Normalize testnet flag so other modules can read a boolean
+        config["BYBIT_TESTNET"] = str(config.get("BYBIT_TESTNET", "false")).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
     except Exception as exc:  # broad to keep example child friendly
         logger.error("Validation failed: %s", exc)
-        try:
-            asyncio.run(notify("Config validation failed", str(exc)))
-        except RuntimeError:
-            pass
+        notify_sync("Config validation failed", str(exc))
         return False
     logger.info("Config validated successfully.")
     return True
@@ -238,7 +255,7 @@ def encrypt_config(data: Dict[str, Any]) -> bytes:
         return _CIPHER.encrypt(plaintext)
     except Exception as exc:  # pragma: no cover - encryption rarely fails
         logger.error("Encryption error: %s", exc)
-        asyncio.run(notify("Encryption error", str(exc)))
+        notify_sync("Encryption error", str(exc))
         raise
 
 
@@ -265,12 +282,23 @@ def decrypt_config(encrypted_data: bytes) -> Dict[str, Any]:
         return json.loads(decrypted.decode())
     except Exception as exc:  # pragma: no cover - depends on input
         logger.error("Decryption error: %s", exc)
-        asyncio.run(notify("Decryption error", str(exc)))
+        notify_sync("Decryption error", str(exc))
         raise ValueError("invalid encrypted data") from exc
 
 
 # ---------------------------------------------------------------------------
-# 5. get_spot_pairs                                                          
+# Internal helper to parse pair lists
+# ---------------------------------------------------------------------------
+def _parse_pairs(pairs: Any) -> List[str]:
+    """Normalize a pair list that may be a JSON string."""
+    if isinstance(pairs, str):
+        pairs = pairs.replace("'", '"')
+        return json.loads(pairs)
+    return pairs
+
+
+# ---------------------------------------------------------------------------
+# 5. get_spot_pairs
 # ---------------------------------------------------------------------------
 def get_spot_pairs() -> List[str]:
     """Return the list of spot pairs from the loaded configuration.
@@ -281,11 +309,7 @@ def get_spot_pairs() -> List[str]:
     >>> get_spot_pairs()
     ['BTC/USDT']
     """
-    pairs = CONFIG.get("SPOT_PAIRS", "[]")
-    if isinstance(pairs, str):
-        pairs = pairs.replace("'", '"')
-        pairs = json.loads(pairs)
-    return pairs
+    return _parse_pairs(CONFIG.get("SPOT_PAIRS", "[]"))
 
 
 # ---------------------------------------------------------------------------
@@ -300,11 +324,7 @@ def get_futures_pairs() -> List[str]:
     >>> get_futures_pairs()
     ['BTCUSDT']
     """
-    pairs = CONFIG.get("FUTURES_PAIRS", "[]")
-    if isinstance(pairs, str):
-        pairs = pairs.replace("'", '"')
-        pairs = json.loads(pairs)
-    return pairs
+    return _parse_pairs(CONFIG.get("FUTURES_PAIRS", "[]"))
 
 
 # ---------------------------------------------------------------------------
@@ -357,16 +377,34 @@ def get_pair_thresholds(symbol: str) -> Dict[str, float]:
         close_val = float(CONFIG[close_key])
     except KeyError as exc:
         logger.error("Missing threshold for %s: %s", symbol, exc)
-        try:
-            asyncio.run(notify("Missing threshold", f"{symbol}: {exc}"))
-        except RuntimeError:
-            pass
+        notify_sync("Missing threshold", f"{symbol}: {exc}")
         raise
     return {"open": open_val, "close": close_val}
 
 
 # ---------------------------------------------------------------------------
-# 9. update_config                                                           
+# 9. is_testnet
+# ---------------------------------------------------------------------------
+def is_testnet(config: Dict[str, Any] | None = None) -> bool:
+    """Return ``True`` if configuration enables Bybit testnet.
+
+    This flag allows the strategy to operate against Bybit's test
+    environment before moving to real trading.
+
+    Parameters
+    ----------
+    config:
+        Optional configuration dictionary to check.  Defaults to the module
+        level :data:`CONFIG`.
+    """
+
+    cfg = config or CONFIG
+    value = str(cfg.get("BYBIT_TESTNET", "false")).lower()
+    return value in {"1", "true", "yes"}
+
+
+# ---------------------------------------------------------------------------
+# 10. update_config
 # ---------------------------------------------------------------------------
 async def update_config(key: str, value: Any) -> None:
     """Asynchronously update a single configuration value.
@@ -405,7 +443,7 @@ async def update_config(key: str, value: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. backup_config                                                          
+# 11. backup_config
 # ---------------------------------------------------------------------------
 async def backup_config() -> None:
     """Create a timestamped copy of the ``.env`` file asynchronously.
