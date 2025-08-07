@@ -6,7 +6,11 @@ strategies.
 """
 from __future__ import annotations
 
+import logging
 from typing import Iterable, List, Sequence, Tuple
+
+
+logger = logging.getLogger(__name__)
 
 
 def detect_anomalies(data: Sequence[float], z_thresh: float = 3.0) -> List[int]:
@@ -118,4 +122,61 @@ def calculate_macd(
     hist_length = min(len(macd_line), len(signal_line))
     histogram = [macd_line[i] - signal_line[i] for i in range(hist_length)]
     return macd_line, signal_line, histogram
+
+
+def filter_data(prices: Sequence[float], z_thresh: float = 3.0) -> List[float]:
+    """Remove anomalous values from ``prices`` based on ``z_thresh``."""
+
+    anomalies = set(detect_anomalies(prices, z_thresh))
+    return [p for i, p in enumerate(prices) if i not in anomalies]
+
+
+def generate_signal(prices: Sequence[float], rsi_period: int = 14) -> List[int]:
+    """Generate trade signals using RSI and MACD indicators.
+
+    A signal of ``1`` indicates a potential long entry, ``-1`` a short
+    entry and ``0`` no action.
+    """
+
+    rsi = calculate_rsi(prices, rsi_period)
+    macd_line, signal_line, _ = calculate_macd(prices)
+    signals: List[int] = []
+    for i in range(len(prices)):
+        sig = 0
+        if i < len(macd_line) and i < len(signal_line):
+            if macd_line[i] > signal_line[i] and rsi[i] < 30:
+                sig = 1
+            elif macd_line[i] < signal_line[i] and rsi[i] > 70:
+                sig = -1
+        signals.append(sig)
+    return signals
+
+
+def log_data_analysis(results: dict) -> None:
+    """Log key metrics from data analysis."""
+
+    for key, value in results.items():
+        logger.info("%s: %s", key, value)
+
+
+def backtest_analysis(prices: Sequence[float]) -> dict:
+    """Run indicator calculations and signal generation for backtesting."""
+
+    filtered = filter_data(prices)
+    rsi = calculate_rsi(filtered)
+    macd_line, signal_line, histogram = calculate_macd(filtered)
+    signals = generate_signal(filtered)
+    summary = {
+        "anomalies_removed": len(prices) - len(filtered),
+        "signals_generated": sum(1 for s in signals if s),
+    }
+    log_data_analysis(summary)
+    return {
+        "filtered_prices": filtered,
+        "rsi": rsi,
+        "macd_line": macd_line,
+        "signal_line": signal_line,
+        "histogram": histogram,
+        "signals": signals,
+    }
 
