@@ -8,7 +8,12 @@ functionality.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Any
+from typing import Callable, Dict, Iterable, List, Any, Sequence
+from concurrent.futures import ThreadPoolExecutor
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -42,7 +47,11 @@ class Backtester:
         """
         trades: List[Dict[str, float]] = []
         for snapshot in historical_data:
-            trade = self.simulate_trade(snapshot, strategy)
+            trade = self.simulate_trade(
+                snapshot,
+                strategy,
+                snapshot.get("slippage", 0.0),
+            )
             if trade:
                 trades.append(trade)
         return self.generate_report(trades)
@@ -51,6 +60,7 @@ class Backtester:
         self,
         snapshot: Dict[str, float],
         strategy: Callable[[Dict[str, float]], str],
+        slippage: float = 0.0,
     ) -> Dict[str, float] | None:
         """Simulate a single trade based on the strategy decision.
 
@@ -70,6 +80,7 @@ class Backtester:
             pnl = snapshot["spot"] - snapshot["future"]
         else:
             return None
+        pnl -= self.calculate_slippage(0.0, slippage)
         return {"decision": decision, "pnl": pnl}
 
     def generate_report(self, trades: List[Dict[str, float]]) -> Dict[str, float]:
@@ -84,4 +95,29 @@ class Backtester:
             profit or loss.
         """
         total_pnl = sum(t["pnl"] for t in trades)
-        return {"trades": len(trades), "total_pnl": total_pnl}
+        result = {"trades": len(trades), "total_pnl": total_pnl}
+        self.log_results(result)
+        return result
+
+    def calculate_slippage(self, expected_price: float, executed_price: float) -> float:
+        """Return the absolute slippage between expected and executed price."""
+        return executed_price - expected_price
+
+    def run_in_parallel(
+        self,
+        datasets: Sequence[Iterable[Dict[str, float]]],
+        strategy: Callable[[Dict[str, float]], str],
+        max_workers: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """Run multiple backtests concurrently for faster evaluation."""
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(self.backtest, data, strategy) for data in datasets]
+            return [f.result() for f in futures]
+
+    def log_results(self, result: Dict[str, Any]) -> None:
+        """Log the summary of a backtest run."""
+        logger.info(
+            "Executed %s trades with total PnL %.4f",
+            result.get("trades", 0),
+            result.get("total_pnl", 0.0),
+        )
