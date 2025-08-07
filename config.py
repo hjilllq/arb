@@ -287,7 +287,18 @@ def decrypt_config(encrypted_data: bytes) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 5. get_spot_pairs                                                          
+# Internal helper to parse pair lists
+# ---------------------------------------------------------------------------
+def _parse_pairs(pairs: Any) -> List[str]:
+    """Normalize a pair list that may be a JSON string."""
+    if isinstance(pairs, str):
+        pairs = pairs.replace("'", '"')
+        return json.loads(pairs)
+    return pairs
+
+
+# ---------------------------------------------------------------------------
+# 5. get_spot_pairs
 # ---------------------------------------------------------------------------
 def get_spot_pairs() -> List[str]:
     """Return the list of spot pairs from the loaded configuration.
@@ -298,11 +309,7 @@ def get_spot_pairs() -> List[str]:
     >>> get_spot_pairs()
     ['BTC/USDT']
     """
-    pairs = CONFIG.get("SPOT_PAIRS", "[]")
-    if isinstance(pairs, str):
-        pairs = pairs.replace("'", '"')
-        pairs = json.loads(pairs)
-    return pairs
+    return _parse_pairs(CONFIG.get("SPOT_PAIRS", "[]"))
 
 
 # ---------------------------------------------------------------------------
@@ -317,11 +324,7 @@ def get_futures_pairs() -> List[str]:
     >>> get_futures_pairs()
     ['BTCUSDT']
     """
-    pairs = CONFIG.get("FUTURES_PAIRS", "[]")
-    if isinstance(pairs, str):
-        pairs = pairs.replace("'", '"')
-        pairs = json.loads(pairs)
-    return pairs
+    return _parse_pairs(CONFIG.get("FUTURES_PAIRS", "[]"))
 
 
 # ---------------------------------------------------------------------------

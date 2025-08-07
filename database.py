@@ -8,14 +8,13 @@ energy‑frugal.
 from __future__ import annotations
 
 import asyncio
-import os
 import shutil
 import gzip
 import random
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import aiosqlite
 import pandas as pd

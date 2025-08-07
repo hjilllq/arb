@@ -1,9 +1,8 @@
 import asyncio
-
-import pytest
-
 import sys
 from pathlib import Path
+
+import pytest
 
 # Ensure the repository root is on the import path so ``config`` can be
 # imported without installation.
