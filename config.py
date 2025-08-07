@@ -6,7 +6,8 @@ that the required parameters for running the arbitrage bot are present.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Any
 import os
 
 from dotenv import load_dotenv
@@ -53,14 +54,7 @@ def load_config(path: str = ".env") -> Config:
 
 
 def validate_config(cfg: Config) -> Config:
-    """Validate essential configuration values.
-
-    Raises
-    ------
-    ValueError
-        If a required configuration value is missing or invalid.
-    """
-
+    """Validate essential configuration values."""
     missing = []
     if not cfg.bybit_api_key:
         missing.append("BYBIT_API_KEY")
@@ -69,13 +63,30 @@ def validate_config(cfg: Config) -> Config:
     if not cfg.arbitrage_symbol:
         missing.append("ARBITRAGE_SYMBOL")
 
-    if cfg.arbitrage_threshold <= 0:
-        raise ValueError("ARBITRAGE_THRESHOLD must be greater than 0")
-    if cfg.max_position_size <= 0:
-        raise ValueError("MAX_POSITION_SIZE must be greater than 0")
-
     if missing:
         raise ValueError(
             "Missing configuration values: " + ", ".join(missing)
         )
+
+    validate_thresholds(cfg)
     return cfg
+
+
+def update_config(cfg: Config, **updates: Any) -> Config:
+    """Return a new :class:`Config` with ``updates`` applied."""
+    return replace(cfg, **updates)
+
+
+def get_config_value(cfg: Config, key: str) -> Any:
+    """Fetch a single configuration value by attribute name."""
+    if not hasattr(cfg, key):
+        raise KeyError(f"Unknown configuration field: {key}")
+    return getattr(cfg, key)
+
+
+def validate_thresholds(cfg: Config) -> None:
+    """Ensure threshold-related values are positive."""
+    if cfg.arbitrage_threshold <= 0:
+        raise ValueError("ARBITRAGE_THRESHOLD must be greater than 0")
+    if cfg.max_position_size <= 0:
+        raise ValueError("MAX_POSITION_SIZE must be greater than 0")

@@ -76,11 +76,14 @@ class Backtester:
         pnl = 0.0
         if decision == "buy":
             pnl = snapshot["future"] - snapshot["spot"]
+            expected_price = snapshot["spot"]
         elif decision == "sell":
             pnl = snapshot["spot"] - snapshot["future"]
+            expected_price = snapshot["future"]
         else:
             return None
-        pnl -= self.calculate_slippage(0.0, slippage)
+        executed_price = expected_price + slippage
+        pnl -= self.calculate_slippage(expected_price, executed_price)
         return {"decision": decision, "pnl": pnl}
 
     def generate_report(self, trades: List[Dict[str, float]]) -> Dict[str, float]:
@@ -101,7 +104,7 @@ class Backtester:
 
     def calculate_slippage(self, expected_price: float, executed_price: float) -> float:
         """Return the absolute slippage between expected and executed price."""
-        return executed_price - expected_price
+        return abs(executed_price - expected_price)
 
     def run_in_parallel(
         self,

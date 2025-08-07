@@ -7,6 +7,7 @@ variables ``BYBIT_API_KEY`` and ``BYBIT_API_SECRET``.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import os
@@ -14,6 +15,10 @@ import time
 from typing import Any, Dict, Optional
 
 import httpx
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class BybitAPI:
@@ -49,15 +54,23 @@ class BybitAPI:
 
     async def get_spot_data(self, pair: str) -> Dict[str, Any]:
         """Retrieve 24h ticker information for a spot trading pair."""
-        resp = await self._client.get("/spot/v3/public/quote/ticker/24hr", params={"symbol": pair})
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            try:
+                resp = await self._client.get("/spot/v3/public/quote/ticker/24hr", params={"symbol": pair})
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPError as exc:
+                await self.handle_api_error(exc, attempt)
 
     async def get_futures_data(self, pair: str) -> Dict[str, Any]:
         """Retrieve ticker information for a futures trading pair."""
-        resp = await self._client.get("/derivatives/v3/public/tickers", params={"symbol": pair})
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            try:
+                resp = await self._client.get("/derivatives/v3/public/tickers", params={"symbol": pair})
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPError as exc:
+                await self.handle_api_error(exc, attempt)
 
     async def place_order(
         self,
@@ -68,27 +81,69 @@ class BybitAPI:
         order_type: str = "Limit",
     ) -> Dict[str, Any]:
         """Place an order on Bybit."""
-        params: Dict[str, Any] = {
-            "symbol": pair,
-            "side": side,
-            "orderType": order_type,
-            "price": price,
-            "qty": qty,
-        }
-        params = self._sign(params)
-        resp = await self._client.post("/v5/order/create", json=params)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            try:
+                params: Dict[str, Any] = {
+                    "symbol": pair,
+                    "side": side,
+                    "orderType": order_type,
+                    "price": price,
+                    "qty": qty,
+                }
+                params = self._sign(params)
+                resp = await self._client.post("/v5/order/create", json=params)
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPError as exc:
+                await self.handle_api_error(exc, attempt)
 
     async def cancel_order(self, order_id: str, pair: Optional[str] = None) -> Dict[str, Any]:
         """Cancel a previously placed order."""
-        params: Dict[str, Any] = {"orderId": order_id}
-        if pair is not None:
-            params["symbol"] = pair
-        params = self._sign(params)
-        resp = await self._client.post("/v5/order/cancel", json=params)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            try:
+                params: Dict[str, Any] = {"orderId": order_id}
+                if pair is not None:
+                    params["symbol"] = pair
+                params = self._sign(params)
+                resp = await self._client.post("/v5/order/cancel", json=params)
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPError as exc:
+                await self.handle_api_error(exc, attempt)
+
+    async def check_balance(self) -> Dict[str, Any]:
+        """Fetch wallet balance for the account."""
+        for attempt in range(3):
+            try:
+                params = self._sign({})
+                resp = await self._client.get("/v5/account/wallet-balance", params=params)
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPError as exc:
+                await self.handle_api_error(exc, attempt)
+
+    async def get_order_status(self, order_id: str, pair: Optional[str] = None) -> Dict[str, Any]:
+        """Retrieve the current status for a specific order."""
+        for attempt in range(3):
+            try:
+                params: Dict[str, Any] = {"orderId": order_id}
+                if pair is not None:
+                    params["symbol"] = pair
+                params = self._sign(params)
+                resp = await self._client.get("/v5/order/realtime", params=params)
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPError as exc:
+                await self.handle_api_error(exc, attempt)
+
+    async def handle_api_error(self, exc: httpx.HTTPError, attempt: int, retries: int = 3) -> None:
+        """Simple exponential-backoff retry handler for API errors."""
+        logger.warning(
+            "Bybit API error on attempt %d/%d: %s", attempt + 1, retries, exc
+        )
+        if attempt + 1 >= retries:
+            raise exc
+        await asyncio.sleep(2 ** attempt)
 
     async def close(self) -> None:
         """Close the underlying HTTP client session."""
