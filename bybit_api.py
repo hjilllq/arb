@@ -32,18 +32,26 @@ _client: Optional[ccxt.bybit] = None
 # ---------------------------------------------------------------------------
 # 1. connect_api
 # ---------------------------------------------------------------------------
-async def connect_api(api_key: str, api_secret: str) -> None:
+async def connect_api(api_key: str, api_secret: str, use_testnet: bool = False) -> None:
     """Connect to Bybit's REST API asynchronously.
+
+    The connection follows Bybit's official documentation and supports both
+    the real market and the testnet environment.  Set ``use_testnet`` to
+    ``True`` to run the strategy against Bybit's paper trading platform before
+    moving to production.
 
     Parameters
     ----------
     api_key, api_secret:
         Credentials for Bybit.  They can be plain strings or encrypted values
         that were previously decrypted by :mod:`config`.
+    use_testnet:
+        If ``True`` the client connects to Bybit's testnet; otherwise the
+        production endpoints are used.
 
     Examples
     --------
-    >>> await connect_api('key', 'secret')  # doctest: +SKIP
+    >>> await connect_api('key', 'secret', use_testnet=True)  # doctest: +SKIP
     """
     global _client
     _client = ccxt.bybit({
@@ -51,9 +59,11 @@ async def connect_api(api_key: str, api_secret: str) -> None:
         "secret": api_secret,
         "enableRateLimit": True,
     })
+    _client.set_sandbox_mode(use_testnet)
     try:
         await _client.load_markets()
-        await logger.log_info("Connected to Bybit API")
+        env = "testnet" if use_testnet else "mainnet"
+        await logger.log_info(f"Connected to Bybit API ({env})")
     except Exception as exc:
         await handle_api_error(exc)
 
