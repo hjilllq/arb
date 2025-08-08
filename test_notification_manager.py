@@ -76,3 +76,22 @@ def test_log_notification(monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger="arb"):
         nm.send_slack_notification("msg")
     assert "NOTIFY[slack]: msg" in caplog.text
+
+
+def test_notify_critical(monkeypatch):
+    called = {"tg": 0, "email": 0, "slack": 0}
+
+    nm = NotificationManager(
+        telegram_token="t",
+        telegram_chat_id="c",
+        email_sender="e@example.com",
+        slack_webhook_url="http://example.com",
+    )
+
+    nm.send_telegram_notification = lambda msg: called.__setitem__("tg", called["tg"] + 1) or True
+    nm.send_email_notification = lambda subj, body, rec: called.__setitem__("email", called["email"] + 1) or True
+    nm.send_slack_notification = lambda msg: called.__setitem__("slack", called["slack"] + 1) or True
+
+    nm.notify_critical("boom")
+
+    assert called == {"tg": 1, "email": 1, "slack": 1}

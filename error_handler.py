@@ -98,6 +98,9 @@ def handle_error(
     log_error(message, exc)
     if notifier:
         try:
-            notifier.send_telegram_notification(f"{message}: {exc}")
+            if hasattr(notifier, "notify_critical"):
+                notifier.notify_critical(f"{message}: {exc}")
+            else:
+                notifier.send_telegram_notification(f"{message}: {exc}")
         except Exception as notify_exc:  # pragma: no cover - оповещение может провалиться
             log_error("Failed to send error notification", notify_exc)

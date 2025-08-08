@@ -8,13 +8,8 @@ class DummyNotifier:
         self.messages: list[str] = []
         self.email_sender = "test@example.com"
 
-    def send_telegram_notification(self, message: str) -> bool:  # pragma: no cover - простая заглушка
+    def notify_critical(self, message: str) -> None:  # pragma: no cover - простая заглушка
         self.messages.append(message)
-        return True
-
-    def send_email_notification(self, subject: str, body: str, recipients):  # pragma: no cover - простая заглушка
-        self.messages.append(body)
-        return True
 
 
 def test_calculate_position_size(monkeypatch):

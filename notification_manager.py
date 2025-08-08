@@ -71,6 +71,18 @@ class NotificationManager:
                 time.sleep(2 ** attempt)
 
     # ------------------------------------------------------------------
+    def notify_critical(self, message: str) -> None:
+        """Разослать уведомление о критической ошибке по доступным каналам."""
+
+        if self.telegram_token and self.telegram_chat_id:
+            self.send_telegram_notification(message)
+        if self.email_sender:
+            # Отправляем письмо самому себе, если не указаны получатели
+            self.send_email_notification("Critical error", message, [self.email_sender])
+        if self.slack_webhook_url:
+            self.send_slack_notification(message)
+
+    # ------------------------------------------------------------------
     # уведомления через Telegram
     def send_telegram_notification(self, message: str) -> bool:
         """Отправить сообщение в Telegram с учётными данными бота."""

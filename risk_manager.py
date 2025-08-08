@@ -222,7 +222,7 @@ class RiskManager:
                 f"daily drawdown {abs(change_pct):.2f}% exceeds {self.daily_loss_soft_pct}%",
             )
             if self.notifier:
-                self.notifier.send_telegram_notification(
+                self.notifier.notify_critical(
                     f"Daily loss {abs(change_pct):.2f}% exceeds {self.daily_loss_soft_pct}%"
                 )
         elif change_pct > -self.daily_loss_soft_pct and self._soft_loss_triggered:
@@ -307,7 +307,7 @@ class RiskManager:
             and not self._profit_notified
         ):
             if self.notifier:
-                self.notifier.send_telegram_notification(
+                self.notifier.notify_critical(
                     f"Profit target {self.profit_alert} reached"
                 )
             self._profit_notified = True
@@ -317,7 +317,7 @@ class RiskManager:
             and not self._loss_notified
         ):
             if self.notifier:
-                self.notifier.send_telegram_notification(
+                self.notifier.notify_critical(
                     f"Loss limit {self.loss_alert} reached"
                 )
             self._loss_notified = True
@@ -335,12 +335,7 @@ class RiskManager:
         self.log_risk_management("pause", {"reason": reason})
         if self.notifier:
             message = f"Trading paused: {reason}"
-            # отправляем хотя бы в те каналы, которые настроены
-            self.notifier.send_telegram_notification(message)
-            if self.notifier.email_sender:
-                self.notifier.send_email_notification(
-                    "Risk alert", message, [self.notifier.email_sender]
-                )
+            self.notifier.notify_critical(message)
 
     def log_risk_management(self, action: str, data: Dict[str, Any] | None = None) -> None:
         """Передать сведения об управлении рисками в общий логгер.
