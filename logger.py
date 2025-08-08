@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict
+from typing import Any
 
 from cryptography.fernet import Fernet
 
@@ -107,7 +107,7 @@ def log_event(message: str) -> None:
     logger.info(message)
 
 
-def log_error(message: str, exc: Exception | None = None) -> None:
+def log_error(message: str, error: BaseException | None = None, **ctx: Any) -> None:
     """Записать ошибку.
 
     Parameters
