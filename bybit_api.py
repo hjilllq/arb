@@ -390,6 +390,31 @@ class BybitAPI:
             except httpx.HTTPError as exc:
                 await self.handle_api_error(exc, attempt)
 
+    async def _reset_client(self) -> None:
+        """Пересоздать HTTP‑клиент после критической ошибки.
+
+        Метод закрывает текущее соединение и создаёт новый экземпляр
+        :class:`httpx.AsyncClient`. Это позволяет восстановить работу
+        после сетевых сбоев, когда соединение могло оказаться в
+        некорректном состоянии.
+
+        Связь
+        -----
+        Вызывается из :meth:`handle_api_error` после исчерпания всех
+        попыток, чтобы последующие запросы начинались с «чистого» клиента.
+        """
+
+        try:
+            await self._client.aclose()
+        except Exception:  # pragma: no cover - закрытие может провалиться
+            pass
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=10.0,
+            http2=True,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=20),
+        )
+
     async def handle_api_error(
         self, exc: httpx.HTTPError, attempt: int, retries: int = 3
     ) -> None:
@@ -414,13 +439,25 @@ class BybitAPI:
         Метод вызывается всеми сетевыми запросами этого клиента и помогает
         обеспечить устойчивость работы бота.
         """
+        wait_time = 2 ** attempt
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            if exc.response.status_code == 429:  # превышен лимит запросов
+                retry_after = exc.response.headers.get("Retry-After")
+                if retry_after is not None:
+                    try:
+                        wait_time = float(retry_after)
+                    except ValueError:  # pragma: no cover - некорректный заголовок
+                        pass
         logger.warning(
             "Bybit API error on attempt %d/%d: %s", attempt + 1, retries, exc
         )
         if attempt + 1 >= retries:
+            # уведомляем и пересоздаём клиент, чтобы последующие вызовы
+            # начинались с чистого соединения
+            await self._reset_client()
             handle_error("Bybit API request failed", exc, self.notifier)
             raise exc
-        await asyncio.sleep(2 ** attempt)
+        await asyncio.sleep(wait_time)
 
     async def close(self) -> None:
         """Завершает работу HTTP‑клиента.
