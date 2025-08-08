@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import asyncio
 import aiosqlite
 import shutil
+from contextlib import suppress
 
 from error_handler import handle_error
 from backup_manager import BackupManager
@@ -37,6 +38,7 @@ class TradeDatabase:
     backup_manager: Optional[BackupManager] = None
     _cache: List[tuple] = field(default_factory=list)
     _last_cleanup: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    backup_task: Optional[asyncio.Task] = None
 
     async def __aenter__(self) -> "TradeDatabase":
         await self.connect()
@@ -53,6 +55,10 @@ class TradeDatabase:
         дальше.
         """
 
+        if self.backup_manager is not None:
+            await self.backup_manager.verify_and_restore()
+            if self.backup_task is None:
+                self.backup_task = asyncio.create_task(self.backup_manager.run())
         for attempt in range(3):
             try:
                 self.conn = await aiosqlite.connect(self.db_path)
@@ -170,6 +176,11 @@ class TradeDatabase:
             await self.flush_cache()
             await self.conn.close()
             self.conn = None
+        if self.backup_task is not None:
+            self.backup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.backup_task
+            self.backup_task = None
 
     async def flush_cache(self) -> None:
         """Сохранить накопленные записи на диск."""
