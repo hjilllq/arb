@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -27,11 +28,14 @@ class DependencyManager:
         Файл, где хранится дата последней проверки и версии для отката.
     notifier:
         Менеджер уведомлений, поддерживающий метод ``send_telegram_notification``.
+    api_keys:
+        Словарь ``{имя: ключ}`` для проверки наличия API‑ключей.
     """
 
     requirements_path: str | Path = "requirements.txt"
     state_path: str | Path = "dependency_state.json"
     notifier: object | None = None
+    api_keys: Dict[str, str] = field(default_factory=dict)
     _state: Dict[str, object] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
@@ -45,6 +49,7 @@ class DependencyManager:
                 self._state = {}
         self._state.setdefault("last_check", None)
         self._state.setdefault("previous_versions", {})
+        self._state.setdefault("os_version", platform.platform())
 
     # ------------------------------------------------------------------
     def _save_state(self) -> None:
@@ -146,11 +151,48 @@ class DependencyManager:
         self._save_state()
 
     # ------------------------------------------------------------------
+    def check_api_keys(self) -> Dict[str, bool]:
+        """Проверить наличие API‑ключей.
+
+        Возвращает словарь ``{имя: валиден}``. Ключ считается валидным,
+        если он непустой. При обнаружении проблем отправляется уведомление.
+        """
+        results: Dict[str, bool] = {}
+        for name, key in self.api_keys.items():
+            valid = bool(key)
+            results[name] = valid
+            if not valid and self.notifier:
+                self.notifier.send_telegram_notification(
+                    f"Некорректный API‑ключ: {name}"
+                )
+        return results
+
+    # ------------------------------------------------------------------
+    def check_os_version(self) -> str:
+        """Проверить версию операционной системы.
+
+        Если версия изменилась по сравнению с сохранённой, отправить
+        уведомление и обновить состояние.
+        """
+        current = platform.platform()
+        previous = self._state.get("os_version")
+        if previous != current and self.notifier:
+            self.notifier.send_telegram_notification(
+                f"Версия ОС изменилась: {previous} -> {current}"
+            )
+        self._state["os_version"] = current
+        self._save_state()
+        return current
+
+    # ------------------------------------------------------------------
     def daily_check(self) -> Dict[str, Tuple[str, str]]:
-        """Выполнить проверку, если с момента последнего запуска прошли сутки."""
+        """Выполнить проверку, если прошли сутки с последнего запуска."""
         last = self._state.get("last_check")
         if last:
             last_dt = datetime.fromisoformat(last)
             if datetime.now(timezone.utc) - last_dt < timedelta(days=1):
                 return {}
-        return self.check_for_updates()
+        updates = self.check_for_updates()
+        self.check_api_keys()
+        self.check_os_version()
+        return updates
