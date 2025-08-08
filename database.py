@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+import asyncio
 import aiosqlite
 import shutil
 
@@ -45,10 +46,24 @@ class TradeDatabase:
         await self.close()
 
     async def connect(self) -> None:
-        """Открыть соединение и подготовить таблицы."""
-        self.conn = await aiosqlite.connect(self.db_path)
-        self.conn.row_factory = aiosqlite.Row
-        await self._create_tables()
+        """Открыть соединение и подготовить таблицы.
+
+        При ошибке подключения выполняется до трёх попыток с экспоненциальной
+        задержкой. Если все попытки исчерпаны, ошибка фиксируется и пробрасывается
+        дальше.
+        """
+
+        for attempt in range(3):
+            try:
+                self.conn = await aiosqlite.connect(self.db_path)
+                self.conn.row_factory = aiosqlite.Row
+                await self._create_tables()
+                return
+            except Exception as exc:
+                if attempt + 1 >= 3:
+                    handle_error("Database connection failed", exc)
+                    raise
+                await asyncio.sleep(2 ** attempt)
 
     async def _create_tables(self) -> None:
         assert self.conn is not None

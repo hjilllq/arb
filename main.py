@@ -12,9 +12,11 @@ from typing import Optional
 from config import Config, load_config, validate_config
 from exchange_manager import ExchangeManager
 from heartbeat import HeartbeatMonitor
+from notification_manager import NotificationManager
+from error_handler import install_global_handler, handle_error
 import os
 
-from logger import log_event, log_error, configure_logging
+from logger import log_event, configure_logging
 
 
 class TradingSystem:
@@ -24,6 +26,7 @@ class TradingSystem:
         self.config: Optional[Config] = None
         self.exchange: Optional[ExchangeManager] = None
         self.heartbeat = HeartbeatMonitor()
+        self.notifier: Optional[NotificationManager] = None
         self._running = False
 
     def check_environment(self) -> Config:
@@ -37,7 +40,17 @@ class TradingSystem:
     async def initialize_system(self) -> None:
         """Инициализировать основные компоненты, необходимые для торговли."""
         self.config = self.check_environment()
-        self.exchange = ExchangeManager(self.config)
+        self.notifier = NotificationManager(
+            telegram_token=self.config.telegram_token or None,
+            telegram_chat_id=self.config.telegram_chat_id or None,
+            email_sender=self.config.email_sender or None,
+            email_host=self.config.email_host,
+            email_port=self.config.email_port,
+            slack_webhook_url=self.config.slack_webhook_url or None,
+            sms_api_url=self.config.sms_api_url or None,
+        )
+        install_global_handler(self.notifier)
+        self.exchange = ExchangeManager(self.config, notifier=self.notifier)
         log_event("System initialization complete")
 
     async def start_trading(self) -> None:
@@ -71,7 +84,7 @@ class TradingSystem:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - защитное программирование
-            log_error("Unhandled exception in run", exc)
+            handle_error("Unhandled exception in run", exc, self.notifier)
         finally:
             self.stop_trading()
             if self.exchange:
