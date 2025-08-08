@@ -42,6 +42,8 @@ def test_cleanup_removes_old_and_bad_records(tmp_path):
             assert removed_old == 1
             assert removed_bad == 1
             assert notifier.messages
+            assert "ETHUSDT" in notifier.messages[0]
+            assert "LTCUSDT" in notifier.messages[0]
             # В базе должна остаться только актуальная запись
             history = await db.get_trade_history("BTCUSDT")
             assert len(history) == 1
