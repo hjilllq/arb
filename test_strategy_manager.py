@@ -36,3 +36,22 @@ def test_backtest_strategy():
     ]
     result = manager.test_strategy("simple", history)
     assert result["trades"] >= 1
+
+
+def test_auto_update_parameters():
+    manager = StrategyManager()
+    manager.add_strategy("simple", ArbitrageStrategy(basis_threshold=0.5))
+
+    class DummyNotifier:
+        def __init__(self):
+            self.messages = []
+
+        def send_telegram_notification(self, message: str) -> bool:
+            self.messages.append(message)
+            return True
+
+    notifier = DummyNotifier()
+    pnls = [-1.0, -0.5, 0.2]  # win_rate < 0.5 => увеличиваем порог
+    summary = manager.update_active_parameters(pnls, notifier)
+    assert summary["new_basis"] > summary["old_basis"]
+    assert notifier.messages

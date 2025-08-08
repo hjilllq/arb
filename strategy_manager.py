@@ -7,12 +7,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Any
+from typing import Any, Dict, Iterable, Sequence
 import statistics
 
 from logger import log_event
 from backtester import Backtester
 from strategy import ArbitrageStrategy
+from notification_manager import NotificationManager
 
 
 @dataclass
@@ -120,3 +121,48 @@ class StrategyManager:
             return "buy" if signal == 1 else "sell" if signal == -1 else "hold"
 
         return backtester.backtest(historical_data, _fn)
+
+    def update_active_parameters(
+        self,
+        pnls: Sequence[float],
+        notifier: NotificationManager | None = None,
+    ) -> Dict[str, float]:
+        """Проанализировать результаты и скорректировать параметры стратегии.
+
+        Параметры
+        ---------
+        pnls:
+            Последовательность результатов сделок (прибыль/убыток).
+        notifier:
+            Опциональный менеджер уведомлений. Если передан, отправляет
+            сообщение о внесённых изменениях.
+
+        Возвращает
+        ---------
+        Dict[str, float]
+            Сводка эффективности и старое/новое значение порога ``basis_threshold``.
+
+        Метод оценивает активную стратегию по предоставленным данным и
+        автоматически регулирует её чувствительность: при низком проценте
+        успешных сделок порог увеличивается (торговля становится более
+        консервативной), при высокой доходности — снижается. После изменения
+        параметров вызывается уведомление и запись в лог.
+        """
+
+        strategy = self.get_active_strategy()
+        stats = strategy.evaluate_strategy(pnls)
+        old = strategy.basis_threshold
+
+        if stats["win_rate"] < 0.5:
+            strategy.basis_threshold = round(old + 0.1, 4)
+        elif stats["win_rate"] > 0.7 and old > 0.1:
+            strategy.basis_threshold = round(max(0.0, old - 0.1), 4)
+
+        message = (
+            f"STRATEGY UPDATED: {self.active_name} basis {old} -> {strategy.basis_threshold}"
+        )
+        log_event(message)
+        if notifier:
+            notifier.send_telegram_notification(message)
+
+        return {"old_basis": old, "new_basis": strategy.basis_threshold, **stats}
