@@ -137,9 +137,13 @@ class TradingBot:
                 strategy = self.strategy_manager.get_active_strategy()
             else:
                 strategy = self.strategy
-            decision = await strategy.apply_strategy(
-                self.exchange, spot_pair, futures_pair
+
+            # Получаем решение стратегии и баланс параллельно, чтобы не блокировать
+            decision, balance = await asyncio.gather(
+                strategy.apply_strategy(self.exchange, spot_pair, futures_pair),
+                self.exchange.check_balance(exchange),
             )
+
             price = decision["spot_price"]
             self.price_history.append(price)
             if len(self.price_history) > 100:
@@ -162,34 +166,33 @@ class TradingBot:
                     return {}
                 if self.risk_manager.trading_paused:
                     return {}
-
-            tasks = [self.exchange.check_balance(exchange)]
-            anomalies: List[int] = []
-            if len(self.price_history) >= 5:
-                tasks.append(self._detect_anomalies_async())
-            results = await asyncio.gather(*tasks)
-            balance = results[0]
-            if self.risk_manager:
                 self.risk_manager.update_balance(balance.get("USDT", 0.0))
                 if self.risk_manager.trading_paused:
                     return {}
-            if len(results) > 1:
-                anomalies = results[1]
-            if anomalies and anomalies[-1] == len(self.price_history) - 1:
-                log_event("PRICE ANOMALY DETECTED, SKIP TRADE")
-                if self.risk_manager:
-                    self.risk_manager.pause_trading_if_risk("price anomaly")
-                return {}
 
             cost = decision["spot_price"] * qty
             if balance.get("USDT", 0.0) < cost:
                 handle_error("Insufficient balance", ValueError("low balance"))
                 return {}
 
-            await asyncio.gather(
-                self._cancel_open_orders(spot_pair, exchange),
-                self._cancel_open_orders(futures_pair, exchange),
+            tasks = []
+            anomalies: List[int] = []
+            if len(self.price_history) >= 5:
+                tasks.append(self._detect_anomalies_async())
+            tasks.extend(
+                [
+                    self._cancel_open_orders(spot_pair, exchange),
+                    self._cancel_open_orders(futures_pair, exchange),
+                ]
             )
+            results = await asyncio.gather(*tasks)
+            if len(self.price_history) >= 5:
+                anomalies = results[0]
+            if anomalies and anomalies[-1] == len(self.price_history) - 1:
+                log_event("PRICE ANOMALY DETECTED, SKIP TRADE")
+                if self.risk_manager:
+                    self.risk_manager.pause_trading_if_risk("price anomaly")
+                return {}
 
             signal = decision["signal"]
             if signal == 1:
