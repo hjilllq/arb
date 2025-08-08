@@ -3,6 +3,7 @@ httpx
 h2
 scikit-learn
 numpy
+packaging
 psutil
 python-dotenv
 cryptography
