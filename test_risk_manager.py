@@ -79,3 +79,11 @@ def test_adaptive_position_size():
     # высокая волатильность уменьшает размер ещё вдвое
     adjusted = rm.adjust_position_size(1.0, "aggressive", volatility=2)
     assert adjusted == pytest.approx(0.5 * 0.5 * 0.8)
+
+
+def test_safety_factor_adjustment():
+    rm = RiskManager(max_position_size=10)
+    rm.set_safety_factor(0.5, "health degraded")
+    assert rm.calculate_position_size(1000, 0.01, 10) == 0.5
+    rm.reset_safety_factor()
+    assert rm.calculate_position_size(1000, 0.01, 10) == 1.0

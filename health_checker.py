@@ -16,8 +16,10 @@ from prometheus_client import Gauge, start_http_server
 
 from bybit_api import BybitAPI
 from database import TradeDatabase
+from exchange_manager import ExchangeManager
 from monitor import ResourceMonitor
 from notification_manager import NotificationManager
+from risk_manager import RiskManager
 from trading_bot import TradingBot
 
 
@@ -28,6 +30,7 @@ API_UP = Gauge("bybit_api_up", "Доступность REST API Bybit")
 DB_UP = Gauge("trade_database_up", "Состояние базы данных сделок")
 WS_UP = Gauge("bybit_ws_up", "Доступность WebSocket соединения")
 TRADING_UP = Gauge("trading_process_up", "Активность торгового процесса")
+BALANCE_OK = Gauge("balance_ok", "Достаточность баланса для торговли")
 
 
 @dataclass
@@ -38,7 +41,10 @@ class HealthChecker:
     ws_url: str = "wss://stream.bybit.com/v5/public/quote"
     notifier: Optional[NotificationManager] = None
     trading_bot: Optional[TradingBot] = None
+    exchange_manager: Optional[ExchangeManager] = None
+    risk_manager: Optional[RiskManager] = None
     resource_monitor: ResourceMonitor = field(default_factory=ResourceMonitor)
+    min_balance: float = 0.0
 
     # ------------------------------------------------------------------
     def start_metrics_server(self, port: int = 8000) -> None:
@@ -52,22 +58,31 @@ class HealthChecker:
         db_ok = await self.check_database_health()
         ws_ok = await self.check_websocket_health()
         trading_ok = self.check_trading_process()
+        balance_ok = await self.check_balance()
         resources = self.resource_monitor.check_resources()
         status = {
             "api": api_ok,
             "database": db_ok,
             "websocket": ws_ok,
             "trading": trading_ok,
+            "balance": balance_ok,
         }
 
         API_UP.set(1 if api_ok else 0)
         DB_UP.set(1 if db_ok else 0)
         WS_UP.set(1 if ws_ok else 0)
         TRADING_UP.set(1 if trading_ok else 0)
+        BALANCE_OK.set(1 if balance_ok else 0)
 
         self.log_health_status(status, resources)
-        if not all(status.values()):
+        all_ok = all(status.values())
+        if not all_ok:
             self.send_health_alert(f"System health degraded: {status}")
+            if self.risk_manager:
+                self.risk_manager.set_safety_factor(0.5, "health degraded")
+        else:
+            if self.risk_manager:
+                self.risk_manager.reset_safety_factor()
         return status
 
     # ------------------------------------------------------------------
@@ -111,6 +126,25 @@ class HealthChecker:
                 return True
         except Exception as exc:  # pragma: no cover - сеть
             logger.warning("WebSocket health check failed: %s", exc)
+            return False
+
+    async def check_balance(self) -> bool:
+        """Проверить достаточность баланса для торговли."""
+
+        if not self.exchange_manager:
+            return True
+        try:
+            data = await self.exchange_manager.check_balance()
+            balance = float(data.get("USDT", 0))
+            if balance < self.min_balance:
+                self.send_health_alert(
+                    f"Balance {balance:.2f} below {self.min_balance}"
+                )
+                return False
+            return True
+        except Exception as exc:  # pragma: no cover - непредвиденная ошибка сети
+            logger.warning("Balance check failed: %s", exc)
+            self.send_health_alert("Balance check failed")
             return False
 
     def check_trading_process(self) -> bool:

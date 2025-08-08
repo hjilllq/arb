@@ -38,6 +38,8 @@ class RiskManager:
     recent_results: List[float] = field(default_factory=list)
     performance_factor: float = 1.0
     strategy_multipliers: Dict[str, float] = field(default_factory=dict)
+    # дополнительный коэффициент безопасности, применяемый при сбоях
+    safety_factor: float = 1.0
 
     # ------------------------------------------------------------------
     # работа с конфигурацией
@@ -104,7 +106,7 @@ class RiskManager:
 
         risk_capital = account_balance * risk_per_trade
         size = risk_capital / stop_loss_distance
-        size = min(size, self.max_position_size)
+        size = min(size, self.max_position_size) * self.safety_factor
         self.log_risk_management("position_size", {"size": size})
         return size
 
@@ -205,6 +207,23 @@ class RiskManager:
 
         self.strategy_multipliers[name] = multiplier
 
+    # ------------------------------------------------------------------
+    # управление дополнительным коэффициентом безопасности
+    def set_safety_factor(self, factor: float, reason: str) -> None:
+        """Установить понижающий коэффициент при сбоях или повышенном риске."""
+
+        self.safety_factor = factor
+        self.log_risk_management(
+            "safety_factor", {"factor": factor, "reason": reason}
+        )
+
+    def reset_safety_factor(self) -> None:
+        """Вернуть коэффициент безопасности к значению по умолчанию."""
+
+        if self.safety_factor != 1.0:
+            self.safety_factor = 1.0
+            self.log_risk_management("safety_factor", {"factor": 1.0, "reason": "reset"})
+
     def adjust_position_size(
         self,
         qty: float,
@@ -228,7 +247,7 @@ class RiskManager:
             Итоговый объём с учётом коэффициентов и ограничений.
         """
 
-        factor = self.performance_factor
+        factor = self.performance_factor * self.safety_factor
         if volatility is not None and volatility > self.volatility_threshold:
             factor *= 0.5
         if strategy and strategy in self.strategy_multipliers:
