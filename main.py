@@ -14,6 +14,8 @@ from exchange_manager import ExchangeManager
 from heartbeat import HeartbeatMonitor
 from notification_manager import NotificationManager
 from error_handler import install_global_handler, handle_error
+from database import TradeDatabase
+from data_retention import DataRetentionManager
 import os
 
 from logger import log_event, configure_logging
@@ -27,6 +29,8 @@ class TradingSystem:
         self.exchange: Optional[ExchangeManager] = None
         self.heartbeat = HeartbeatMonitor()
         self.notifier: Optional[NotificationManager] = None
+        self.db: Optional[TradeDatabase] = None
+        self.data_retention: Optional[DataRetentionManager] = None
         self._running = False
 
     def check_environment(self) -> Config:
@@ -51,6 +55,11 @@ class TradingSystem:
         )
         install_global_handler(self.notifier)
         self.exchange = ExchangeManager(self.config, notifier=self.notifier)
+        # Инициализируем базу и менеджер очистки
+        self.db = TradeDatabase()
+        await self.db.connect()
+        self.data_retention = DataRetentionManager(self.db, self.notifier)
+        await self.data_retention.start()
         log_event("System initialization complete")
 
     async def start_trading(self) -> None:
@@ -87,8 +96,12 @@ class TradingSystem:
             handle_error("Unhandled exception in run", exc, self.notifier)
         finally:
             self.stop_trading()
+            if self.data_retention:
+                await self.data_retention.stop()
             if self.exchange:
                 await self.exchange.close()
+            if self.db:
+                await self.db.close()
 
 
 if __name__ == "__main__":
