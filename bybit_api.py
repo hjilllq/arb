@@ -6,25 +6,22 @@ REST API — это веб-интерфейс, к которому обраща�
 при создании клиента, что позволяет полностью контролировать источник
 ключей и секретов.
 """
-
 from __future__ import annotations
 
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 import asyncio
 import hashlib
 import hmac
+import logging
 import time
-from typing import Any, Dict, Optional, Tuple
-from typing import TYPE_CHECKING
 
 import httpx
-import logging
 from prometheus_client import Histogram
 
 from error_handler import handle_error
 
 if TYPE_CHECKING:  # pragma: no cover - только для подсказок типов
     from notification_manager import NotificationManager
-
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +34,7 @@ REQUEST_LATENCY = Histogram(
 
 
 class BybitAPI:
-    """Минимальная асинхронная обёртка над HTTP‑API Bybit.
-
-    HTTP‑API — интерфейс, принимающий запросы по протоколу HTTP.
-    """
+    """Минимальная асинхронная обёртка над HTTP-API Bybit."""
 
     def __init__(
         self,
@@ -53,8 +47,6 @@ class BybitAPI:
         self.api_key = api_key or ""
         self.api_secret = api_secret or ""
         self.base_url = base_url.rstrip("/")
-        # Включаем HTTP/2 (вторую версию протокола HTTP) и ограничиваем количество
-        # соединений, чтобы потребление памяти оставалось под контролем
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=10.0,
@@ -72,43 +64,17 @@ class BybitAPI:
     async def __aexit__(self, *exc_info: Any) -> None:
         await self.close()
 
-    def cleanup_cache(self) -> None:
-        """Очистить просроченные элементы кэша.
+    # ------------------------------ utils ----------------------------
 
-        Элементы, которые хранятся дольше ``cache_ttl`` секунд, удаляются,
-        чтобы кэш не рос бесконтрольно и не занимал лишнюю память.
-        """
+    def cleanup_cache(self) -> None:
+        """Удалить элементы кэша, старше ``cache_ttl`` секунд."""
         now = time.time()
         for key, (ts, _) in list(self._cache.items()):
             if now - ts > self.cache_ttl:
                 del self._cache[key]
 
     def _sign(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Подписывает приватные запросы к API.
-
-        Параметры
-        ----------
-        params: Dict[str, Any]
-            Набор параметров запроса, к которым необходимо добавить ключ,
-            метку времени и HMAC‑подпись.
-
-        Возвращает
-        ----------
-        Dict[str, Any]
-            Те же параметры с полями ``api_key``, ``timestamp`` и ``sign``.
-
-        Исключения
-        ----------
-        RuntimeError
-            Вызывается, если в объекте отсутствуют ключ и секрет для API,
-            поэтому подписать запрос невозможно.
-
-        Связь
-        -----
-        Метод используется внутренне в :meth:`place_order`,
-        :meth:`cancel_order`, :meth:`check_balance` и
-        :meth:`get_order_status` при формировании приватных запросов.
-        """
+        """Подписать приватные запросы к API."""
         if not self.api_key or not self.api_secret:
             raise RuntimeError("API key and secret are required for this operation")
         params["api_key"] = self.api_key
@@ -118,42 +84,23 @@ class BybitAPI:
         params["sign"] = signature
         return params
 
+    # ----------------------------- public ----------------------------
+
     async def get_spot_data(self, pair: str) -> Dict[str, Any]:
-        """Запрашивает статистику по спотовой паре за последние 24 часа.
-
-        Параметры
-        ----------
-        pair: str
-            Символ торговой пары, например ``"BTCUSDT"``.
-
-        Возвращает
-        ----------
-        Dict[str, Any]
-            Ответ API в формате JSON с ценой открытия, закрытия и
-            дополнительными метриками.
-
-        Особенности
-        -----------
-        Метод повторяет запрос до трёх раз при сетевых ошибках. При
-        исчерпании попыток исключение :class:`httpx.HTTPError` пробрасывается
-        выше.
-
-        Связь
-        -----
-        Данные используются в :class:`ExchangeManager`,
-        :class:`Backtester` и стратегиях, зависящих от актуальной цены.
-        """
+        """Статистика 24h по спотовой паре (Bybit v5)."""
         self.cleanup_cache()
         cache_key = ("spot", pair)
         cached = self._cache.get(cache_key)
         now = time.time()
         if cached and now - cached[0] < self.cache_ttl:
             return cached[1]
+
         for attempt in range(3):
             try:
                 with REQUEST_LATENCY.labels("get_spot_data").time():
+                    # v5 tickers (category=spot)
                     resp = await self._client.get(
-                        "/spot/v3/public/quote/ticker/24hr", params={"symbol": pair}
+                        "/v5/market/tickers", params={"category": "spot", "symbol": pair}
                     )
                 resp.raise_for_status()
                 data = resp.json()
@@ -161,42 +108,22 @@ class BybitAPI:
                 return data
             except httpx.HTTPError as exc:
                 await self.handle_api_error(exc, attempt)
+        raise RuntimeError("get_spot_data: exhausted retries")
 
     async def get_futures_data(self, pair: str) -> Dict[str, Any]:
-        """Возвращает информацию о тике фьючерсной пары.
-
-        Параметры
-        ----------
-        pair: str
-            Обозначение фьючерсного инструмента, например ``"BTCUSDT"``.
-
-        Возвращает
-        ----------
-        Dict[str, Any]
-            JSON‑ответ с текущей ценой, объёмом и другими метриками.
-
-        Особенности
-        -----------
-        Выполняет до трёх попыток при возникновении ошибок сети. После
-        последней попытки исключение :class:`httpx.HTTPError` будет
-        передано дальше.
-
-        Связь
-        -----
-        Используется для расчёта базиса в :class:`ArbitrageStrategy` и
-        при тестировании в :class:`Backtester`.
-        """
+        """Тикер фьючерсной пары (Bybit v5, USDT-перп = category=linear)."""
         self.cleanup_cache()
         cache_key = ("futures", pair)
         cached = self._cache.get(cache_key)
         now = time.time()
         if cached and now - cached[0] < self.cache_ttl:
             return cached[1]
+
         for attempt in range(3):
             try:
                 with REQUEST_LATENCY.labels("get_futures_data").time():
                     resp = await self._client.get(
-                        "/derivatives/v3/public/tickers", params={"symbol": pair}
+                        "/v5/market/tickers", params={"category": "linear", "symbol": pair}
                     )
                 resp.raise_for_status()
                 data = resp.json()
@@ -204,6 +131,9 @@ class BybitAPI:
                 return data
             except httpx.HTTPError as exc:
                 await self.handle_api_error(exc, attempt)
+        raise RuntimeError("get_futures_data: exhausted retries")
+
+    # ----------------------------- private ---------------------------
 
     async def place_order(
         self,
@@ -213,36 +143,7 @@ class BybitAPI:
         side: str = "Buy",
         order_type: str = "Limit",
     ) -> Dict[str, Any]:
-        """Создаёт ордер на покупку или продажу.
-
-        Параметры
-        ----------
-        pair: str
-            Торговая пара, по которой размещается ордер.
-        price: float
-            Желаемая цена исполнения.
-        qty: float
-            Количество покупаемого или продаваемого актива.
-        side: str, optional
-            Направление ордера ``"Buy"`` или ``"Sell"``.
-        order_type: str, optional
-            Тип ордера, например ``"Limit"`` или ``"Market"``.
-
-        Возвращает
-        ----------
-        Dict[str, Any]
-            JSON‑ответ Bybit с данными об ордере.
-
-        Особенности
-        -----------
-        Повторяет запрос до трёх раз. Возможны ошибки
-        :class:`httpx.HTTPError` при сетевых проблемах либо при отказе API.
-
-        Связь
-        -----
-        Вызывается из :class:`ExchangeManager` и в конечном итоге используется
-        стратегией и торговым ботом для размещения сделок.
-        """
+        """Создать ордер на покупку/продажу (Bybit v5)."""
         for attempt in range(3):
             try:
                 params: Dict[str, Any] = {
@@ -251,6 +152,7 @@ class BybitAPI:
                     "orderType": order_type,
                     "price": price,
                     "qty": qty,
+                    # при необходимости: "category": "linear"/"spot"
                 }
                 params = self._sign(params)
                 with REQUEST_LATENCY.labels("place_order").time():
@@ -259,35 +161,10 @@ class BybitAPI:
                 return resp.json()
             except httpx.HTTPError as exc:
                 await self.handle_api_error(exc, attempt)
+        raise RuntimeError("place_order: exhausted retries")
 
-    async def cancel_order(
-        self, order_id: str, pair: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Отменяет ранее созданный ордер на бирже.
-
-        Параметры
-        ----------
-        order_id: str
-            Идентификатор ордера, полученный при его создании.
-        pair: str, optional
-            Торговая пара. Если не указана, API попытается определить её
-            автоматически.
-
-        Возвращает
-        ----------
-        Dict[str, Any]
-            JSON‑ответ от API Bybit о статусе отмены.
-
-        Особенности
-        -----------
-        Запрос повторяется до трёх раз; ошибки сети приводят к выбрасыванию
-        :class:`httpx.HTTPError`.
-
-        Связь
-        -----
-        Используется в :class:`ExchangeManager` и косвенно торговым ботом
-        для управления активными позициями.
-        """
+    async def cancel_order(self, order_id: str, pair: Optional[str] = None) -> Dict[str, Any]:
+        """Отменить ранее созданный ордер."""
         for attempt in range(3):
             try:
                 params: Dict[str, Any] = {"orderId": order_id}
@@ -300,65 +177,23 @@ class BybitAPI:
                 return resp.json()
             except httpx.HTTPError as exc:
                 await self.handle_api_error(exc, attempt)
+        raise RuntimeError("cancel_order: exhausted retries")
 
     async def check_balance(self) -> Dict[str, Any]:
-        """Получает сведения о балансе аккаунта.
-
-        Возвращает
-        ----------
-        Dict[str, Any]
-            JSON‑структура с доступными средствами и замороженными балансами.
-
-        Особенности
-        -----------
-        В случае ошибок сети выполняются повторные попытки. После
-        исчерпания трёх попыток ошибка :class:`httpx.HTTPError` пробрасывается
-        наружу.
-
-        Связь
-        -----
-        Результаты проверяются торговым ботом и менеджером риска для
-        определения доступного капитала.
-        """
+        """Получить сведения о балансе аккаунта."""
         for attempt in range(3):
             try:
                 params = self._sign({})
                 with REQUEST_LATENCY.labels("check_balance").time():
-                    resp = await self._client.get(
-                        "/v5/account/wallet-balance", params=params
-                    )
+                    resp = await self._client.get("/v5/account/wallet-balance", params=params)
                 resp.raise_for_status()
                 return resp.json()
             except httpx.HTTPError as exc:
                 await self.handle_api_error(exc, attempt)
+        raise RuntimeError("check_balance: exhausted retries")
 
-    async def get_order_status(
-        self, order_id: str, pair: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Возвращает текущее состояние ордера.
-
-        Параметры
-        ----------
-        order_id: str
-            Идентификатор ордера.
-        pair: str, optional
-            Торговая пара, к которой относится ордер.
-
-        Возвращает
-        ----------
-        Dict[str, Any]
-            Структура JSON со статусом и подробностями ордера.
-
-        Особенности
-        -----------
-        Повторяет запросы при ошибках сети. После трёх попыток
-        :class:`httpx.HTTPError` будет поднято.
-
-        Связь
-        -----
-        Используется торговым ботом и менеджером позиций для отслеживания
-        исполнения сделок.
-        """
+    async def get_order_status(self, order_id: str, pair: Optional[str] = None) -> Dict[str, Any]:
+        """Текущее состояние ордера."""
         for attempt in range(3):
             try:
                 params: Dict[str, Any] = {"orderId": order_id}
@@ -366,17 +201,15 @@ class BybitAPI:
                     params["symbol"] = pair
                 params = self._sign(params)
                 with REQUEST_LATENCY.labels("get_order_status").time():
-                    resp = await self._client.get(
-                        "/v5/order/realtime", params=params
-                    )
+                    resp = await self._client.get("/v5/order/realtime", params=params)
                 resp.raise_for_status()
                 return resp.json()
             except httpx.HTTPError as exc:
                 await self.handle_api_error(exc, attempt)
+        raise RuntimeError("get_order_status: exhausted retries")
 
     async def get_open_orders(self, pair: Optional[str] = None) -> Dict[str, Any]:
-        """Возвращает список текущих открытых ордеров."""
-
+        """Список текущих открытых ордеров."""
         for attempt in range(3):
             try:
                 params: Dict[str, Any] = {}
@@ -389,24 +222,15 @@ class BybitAPI:
                 return resp.json()
             except httpx.HTTPError as exc:
                 await self.handle_api_error(exc, attempt)
+        raise RuntimeError("get_open_orders: exhausted retries")
+
+    # --------------------------- recovery ----------------------------
 
     async def _reset_client(self) -> None:
-        """Пересоздать HTTP‑клиент после критической ошибки.
-
-        Метод закрывает текущее соединение и создаёт новый экземпляр
-        :class:`httpx.AsyncClient`. Это позволяет восстановить работу
-        после сетевых сбоев, когда соединение могло оказаться в
-        некорректном состоянии.
-
-        Связь
-        -----
-        Вызывается из :meth:`handle_api_error` после исчерпания всех
-        попыток, чтобы последующие запросы начинались с «чистого» клиента.
-        """
-
+        """Пересоздать HTTP-клиент после критической ошибки."""
         try:
             await self._client.aclose()
-        except Exception:  # pragma: no cover - закрытие может провалиться
+        except Exception:  # pragma: no cover
             pass
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
@@ -415,30 +239,8 @@ class BybitAPI:
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=20),
         )
 
-    async def handle_api_error(
-        self, exc: httpx.HTTPError, attempt: int, retries: int = 3
-    ) -> None:
-        """Обрабатывает ошибки HTTP с повтором запроса.
-
-        Параметры
-        ----------
-        exc: httpx.HTTPError
-            Возникшая ошибка HTTP.
-        attempt: int
-            Номер текущей попытки (начиная с нуля).
-        retries: int, optional
-            Максимальное количество попыток.
-
-        Особенности
-        -----------
-        Использует экспоненциальное увеличение времени ожидания: 1, 2, 4 секунды.
-        Если предел попыток превышен, ошибка пробрасывается дальше.
-
-        Связь
-        -----
-        Метод вызывается всеми сетевыми запросами этого клиента и помогает
-        обеспечить устойчивость работы бота.
-        """
+    async def handle_api_error(self, exc: httpx.HTTPError, attempt: int, retries: int = 3) -> None:
+        """Обработать HTTP-ошибку с экспоненциальным бэкоффом и, при необходимости, ротацией клиента."""
         wait_time = 2 ** attempt
         if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
             if exc.response.status_code == 429:  # превышен лимит запросов
@@ -446,30 +248,18 @@ class BybitAPI:
                 if retry_after is not None:
                     try:
                         wait_time = float(retry_after)
-                    except ValueError:  # pragma: no cover - некорректный заголовок
+                    except ValueError:  # pragma: no cover
                         pass
-        logger.warning(
-            "Bybit API error on attempt %d/%d: %s", attempt + 1, retries, exc
-        )
+
+        logger.warning("Bybit API error on attempt %d/%d: %s", attempt + 1, retries, exc)
+
         if attempt + 1 >= retries:
-            # уведомляем и пересоздаём клиент, чтобы последующие вызовы
-            # начинались с чистого соединения
             await self._reset_client()
             handle_error("Bybit API request failed", exc, self.notifier)
             raise exc
+
         await asyncio.sleep(wait_time)
 
     async def close(self) -> None:
-        """Завершает работу HTTP‑клиента.
-
-        Особенности
-        -----------
-        Освобождает сетевые ресурсы. Должен вызываться при завершении работы
-        всех компонентов, использующих API.
-
-        Связь
-        -----
-        Применяется менеджерами обмена и тестером для корректного закрытия
-        соединений.
-        """
+        """Корректно закрыть HTTP-клиент."""
         await self._client.aclose()
