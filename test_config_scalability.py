@@ -35,3 +35,6 @@ def test_load_config_with_pairs(tmp_path):
     assert cfg.macd_signal == 5
     assert cfg.profit_alert == 5
     assert cfg.loss_alert == 3
+    assert cfg.db_path == "trades.db"
+    assert cfg.backup_dir == "backups"
+    assert cfg.backup_interval_hours == 24

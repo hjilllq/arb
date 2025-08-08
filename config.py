@@ -43,6 +43,9 @@ class Config:
     email_port: int
     sms_api_url: str
     log_level: str
+    db_path: str
+    backup_dir: str
+    backup_interval_hours: int
     accounts: List["AccountConfig"] = field(default_factory=list)
 
 
@@ -160,6 +163,9 @@ def load_config(path: str = ".env") -> Config:
         email_port=int(os.getenv("EMAIL_PORT", "25")),
         sms_api_url=os.getenv("SMS_API_URL", ""),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
+        db_path=os.getenv("DB_PATH", "trades.db"),
+        backup_dir=os.getenv("BACKUP_DIR", "backups"),
+        backup_interval_hours=int(os.getenv("BACKUP_INTERVAL_HOURS", "24")),
     )
     log_event("Configuration loaded")
     return cfg
@@ -295,6 +301,8 @@ def validate_thresholds(cfg: Config) -> None:
     }.items():
         if val <= 0:
             raise ValueError(f"{name} must be greater than 0")
+    if cfg.backup_interval_hours <= 0:
+        raise ValueError("BACKUP_INTERVAL_HOURS must be greater than 0")
 
 
 def validate_security(cfg: Config) -> None:

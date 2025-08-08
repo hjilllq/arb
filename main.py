@@ -15,6 +15,7 @@ from heartbeat import HeartbeatMonitor
 from notification_manager import NotificationManager
 from error_handler import install_global_handler, handle_error
 from database import TradeDatabase
+from backup_manager import BackupManager
 from data_retention import DataRetentionManager
 import os
 
@@ -56,7 +57,13 @@ class TradingSystem:
         install_global_handler(self.notifier)
         self.exchange = ExchangeManager(self.config, notifier=self.notifier)
         # Инициализируем базу и менеджер очистки
-        self.db = TradeDatabase()
+        backup_mgr = BackupManager(
+            files=[self.config.db_path],
+            backup_dir=self.config.backup_dir,
+            interval_hours=self.config.backup_interval_hours,
+            encryption_key=os.getenv("FERNET_KEY"),
+        )
+        self.db = TradeDatabase(db_path=self.config.db_path, backup_manager=backup_mgr)
         await self.db.connect()
         self.data_retention = DataRetentionManager(self.db, self.notifier)
         await self.data_retention.start()
