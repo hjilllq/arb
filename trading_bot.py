@@ -12,6 +12,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 from logger import log_event, log_trade_data, log_system_health
+from config import load_config
 from error_handler import handle_error
 from strategy import ArbitrageStrategy
 from strategy_manager import StrategyManager
@@ -29,12 +30,13 @@ class TradingBot:
     strategy_manager: StrategyManager | None = None
     risk_manager: RiskManager | None = None
     position_manager: PositionManager | None = None
+    notifier: Any | None = None
     active: bool = field(default=False)
     slippage: float = 0.001
     fee_rate: float = 0.001
     max_retries: int = 3
     price_history: List[float] = field(default_factory=list)
-    trading_pairs: List[Tuple[str, str]] | None = None
+    trading_pairs: List[Tuple[str, str, str]] | None = None
     executor: ThreadPoolExecutor = field(
         default_factory=lambda: ThreadPoolExecutor(max_workers=3)
     )
@@ -63,11 +65,11 @@ class TradingBot:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.executor, detect_anomalies, self.price_history)
 
-    async def _cancel_open_orders(self, pair: str) -> None:
+    async def _cancel_open_orders(self, pair: str, exchange: str = "bybit") -> None:
         """Отменить уже существующие ордера по указанной паре."""
 
         try:
-            open_orders = await self.exchange.get_open_orders(pair)
+            open_orders = await self.exchange.get_open_orders(pair, exchange)
         except Exception as exc:  # pragma: no cover - сетевые сбои
             handle_error("Fetch open orders failed", exc)
             return
@@ -80,19 +82,21 @@ class TradingBot:
             if order_id is None:
                 continue
             try:
-                await self.exchange.cancel_order(order_id, pair)
+                await self.exchange.cancel_order(order_id, pair, exchange)
             except Exception as exc:  # pragma: no cover - сбой отмены
                 handle_error(f"Cancel order {order_id} failed", exc)
 
     async def _place_with_retry(
-        self, pair: str, price: float, qty: float, side: str
+        self, pair: str, price: float, qty: float, side: str, exchange: str
     ) -> Dict[str, Any]:
         """Разместить ордер, учитывая проскальзывание, комиссию и повторы."""
         adj_price = price * (1 + self.slippage if side == "Buy" else 1 - self.slippage)
         fee = abs(adj_price * qty) * self.fee_rate
         for attempt in range(self.max_retries):
             try:
-                order = await self.exchange.place_order(pair, adj_price, qty, side)
+                order = await self.exchange.place_order(
+                    pair, adj_price, qty, side, exchange=exchange
+                )
                 order_id = (
                     order.get("id")
                     or order.get("order_id")
@@ -100,7 +104,9 @@ class TradingBot:
                 )
                 if order_id is None:
                     raise RuntimeError("No order id returned")
-                status = await self.exchange.get_order_status(order_id, pair)
+                status = await self.exchange.get_order_status(
+                    order_id, pair, exchange
+                )
                 state = status.get("status") or status.get("result", {}).get("orderStatus")
                 if state and state.lower() in {"filled", "closed"}:
                     order.update(
@@ -118,12 +124,16 @@ class TradingBot:
             await asyncio.sleep(0.5)
         raise RuntimeError(f"Order {pair} failed after retries")
 
-    async def execute_trade(self, spot_pair: str, futures_pair: str, qty: float) -> Dict[str, Any]:
+    async def execute_trade(
+        self, spot_pair: str, futures_pair: str, qty: float, exchange: str = "bybit"
+    ) -> Dict[str, Any]:
         """Исполнить сделку на основе текущего сигнала стратегии."""
         orders: Dict[str, Any] = {}
         try:
             if self.strategy_manager:
-                await self.strategy_manager.evaluate_market(self.exchange, spot_pair)
+                await self.strategy_manager.evaluate_market(
+                    self.exchange, spot_pair, exchange
+                )
                 strategy = self.strategy_manager.get_active_strategy()
             else:
                 strategy = self.strategy
@@ -153,7 +163,7 @@ class TradingBot:
                 if self.risk_manager.trading_paused:
                     return {}
 
-            tasks = [self.exchange.check_balance()]
+            tasks = [self.exchange.check_balance(exchange)]
             anomalies: List[int] = []
             if len(self.price_history) >= 5:
                 tasks.append(self._detect_anomalies_async())
@@ -177,27 +187,27 @@ class TradingBot:
                 return {}
 
             await asyncio.gather(
-                self._cancel_open_orders(spot_pair),
-                self._cancel_open_orders(futures_pair),
+                self._cancel_open_orders(spot_pair, exchange),
+                self._cancel_open_orders(futures_pair, exchange),
             )
 
             signal = decision["signal"]
             if signal == 1:
                 spot_coro = self._place_with_retry(
-                    spot_pair, decision["spot_price"], qty, "Buy"
+                    spot_pair, decision["spot_price"], qty, "Buy", exchange
                 )
                 fut_coro = self._place_with_retry(
-                    futures_pair, decision["futures_price"], qty, "Sell"
+                    futures_pair, decision["futures_price"], qty, "Sell", exchange
                 )
                 orders["spot"], orders["futures"] = await asyncio.gather(
                     spot_coro, fut_coro
                 )
             elif signal == -1:
                 spot_coro = self._place_with_retry(
-                    spot_pair, decision["spot_price"], qty, "Sell"
+                    spot_pair, decision["spot_price"], qty, "Sell", exchange
                 )
                 fut_coro = self._place_with_retry(
-                    futures_pair, decision["futures_price"], qty, "Buy"
+                    futures_pair, decision["futures_price"], qty, "Buy", exchange
                 )
                 orders["spot"], orders["futures"] = await asyncio.gather(
                     spot_coro, fut_coro
@@ -218,10 +228,10 @@ class TradingBot:
             handle_error("Trade execution failed", exc)
         return orders
 
-    async def monitor_bot_health(self) -> Dict[str, Any]:
+    async def monitor_bot_health(self, exchange: str = "bybit") -> Dict[str, Any]:
         """Получить и залогировать информацию о состоянии, например баланс."""
         try:
-            balance = await self.exchange.check_balance()
+            balance = await self.exchange.check_balance(exchange)
         except Exception as exc:
             handle_error("Balance check failed", exc)
             return {}
@@ -250,8 +260,38 @@ class TradingBot:
 
         if not self.trading_pairs:
             return []
-        tasks = [
-            self.execute_trade(spot, fut, qty)
-            for spot, fut in self.trading_pairs
-        ]
+        tasks = []
+        for item in self.trading_pairs:
+            if len(item) == 3:
+                exch, spot, fut = item
+            else:  # поддержка старого формата
+                spot, fut = item
+                exch = "bybit"
+            tasks.append(self.execute_trade(spot, fut, qty, exch))
         return await asyncio.gather(*tasks)
+
+    # ------------------------------------------------------------------
+    def update_trading_pairs(self, pairs: List[Tuple[str, str, str]]) -> None:
+        """Обновить список торговых пар и уведомить об изменениях."""
+
+        old = set(self.trading_pairs or [])
+        new = set(pairs)
+        added = new - old
+        removed = old - new
+        self.trading_pairs = list(pairs)
+        if not self.notifier:
+            return
+        for exch, spot, fut in added:
+            self.notifier.log_notification(
+                "pairs", f"added {exch}:{spot}:{fut}"
+            )
+        for exch, spot, fut in removed:
+            self.notifier.log_notification(
+                "pairs", f"removed {exch}:{spot}:{fut}"
+            )
+
+    def reload_trading_pairs(self, path: str = ".env") -> None:
+        """Перечитать конфигурацию и обновить торговые пары."""
+
+        cfg = load_config(path)
+        self.update_trading_pairs(cfg.trading_pairs)

@@ -71,7 +71,9 @@ class StrategyManager:
         self.active_name = name
         log_event(f"STRATEGY SWITCHED TO: {name}")
 
-    async def evaluate_market(self, exchange: Any, spot_pair: str) -> None:
+    async def evaluate_market(
+        self, exchange: Any, spot_pair: str, exchange_name: str = "bybit"
+    ) -> None:
         """Оценить рынок и при необходимости поменять стратегию.
 
         Метод запрашивает цену у биржи, добавляет её в историю и при
@@ -81,7 +83,10 @@ class StrategyManager:
         последняя добавленная стратегия. Иначе — первая.
         """
 
-        data = await exchange.get_spot_data(spot_pair)
+        try:
+            data = await exchange.get_spot_data(spot_pair, exchange_name)
+        except TypeError:  # для заглушек без параметра exchange
+            data = await exchange.get_spot_data(spot_pair)
         price = float(data.get("price") or data.get("result", {}).get("lastPrice", 0.0))
         self._prices.append(price)
         if len(self._prices) > 20:

@@ -212,5 +212,7 @@ class TradeDatabase:
 
         if self.backup_manager is None:
             return
+        # Перед созданием резервной копии убедимся, что все данные записаны
+        await self.flush_cache()
         await self.backup_manager.maybe_backup()
 

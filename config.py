@@ -28,7 +28,7 @@ class Config:
     daily_loss_pct: float
     profit_alert: float
     loss_alert: float
-    trading_pairs: List[Tuple[str, str]]
+    trading_pairs: List[Tuple[str, str, str]]
     rsi_period: int
     rsi_overbought: float
     rsi_oversold: float
@@ -118,6 +118,20 @@ def load_config(path: str = ".env") -> Config:
         except Exception:
             notify_security_issue(f"Failed to decrypt credentials for {name}")
 
+    pairs_env = os.getenv("TRADING_PAIRS", "")
+    trading_pairs: List[Tuple[str, str, str]] = []
+    for raw in pairs_env.split(","):
+        if not raw:
+            continue
+        parts = raw.split(":")
+        if len(parts) == 3:
+            exch, spot, fut = parts
+        elif len(parts) == 2:
+            exch, spot, fut = "bybit", parts[0], parts[1]
+        else:
+            exch, spot, fut = "bybit", parts[0], parts[0]
+        trading_pairs.append((exch, spot, fut))
+
     cfg = Config(
         bybit_api_key=api_key,
         bybit_api_secret=api_secret,
@@ -131,11 +145,7 @@ def load_config(path: str = ".env") -> Config:
         daily_loss_pct=float(os.getenv("DAILY_LOSS_PCT", "5")),
         profit_alert=float(os.getenv("PROFIT_ALERT", "0")),
         loss_alert=float(os.getenv("LOSS_ALERT", "0")),
-        trading_pairs=[
-            tuple(pair.split(":", 1)) if ":" in pair else (pair, pair)
-            for pair in os.getenv("TRADING_PAIRS", "").split(",")
-            if pair
-        ],
+        trading_pairs=trading_pairs,
         rsi_period=int(os.getenv("RSI_PERIOD", "14")),
         rsi_overbought=float(os.getenv("RSI_OVERBOUGHT", "70")),
         rsi_oversold=float(os.getenv("RSI_OVERSOLD", "30")),

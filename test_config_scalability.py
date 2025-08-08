@@ -23,7 +23,10 @@ def test_load_config_with_pairs(tmp_path):
     )
     cfg = load_config(str(env_path))
     validate_config(cfg)
-    assert cfg.trading_pairs == [("BTCUSDT", "BTCUSDT"), ("ETHUSDT", "ETHUSDT")]
+    assert cfg.trading_pairs == [
+        ("bybit", "BTCUSDT", "BTCUSDT"),
+        ("bybit", "ETHUSDT", "ETHUSDT"),
+    ]
     assert cfg.rsi_period == 10
     assert cfg.rsi_overbought == 80
     assert cfg.rsi_oversold == 20

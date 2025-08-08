@@ -14,28 +14,28 @@ class DummyExchange:
         self.open_orders = []
         self.cancelled = []
 
-    async def get_spot_data(self, pair):
+    async def get_spot_data(self, pair, exchange="bybit"):
         return {"price": 100.0}
 
-    async def get_futures_data(self, pair):
+    async def get_futures_data(self, pair, exchange="bybit"):
         return {"price": 105.0}
 
-    async def place_order(self, pair, price, qty, side="Buy", order_type="Limit"):
+    async def place_order(self, pair, price, qty, side="Buy", order_type="Limit", exchange="bybit"):
         self.attempts[pair] = self.attempts.get(pair, 0) + 1
         order = {"id": len(self.orders) + 1, "pair": pair, "price": price, "qty": qty, "side": side}
         self.orders.append(order)
         return order
 
-    async def get_order_status(self, order_id, pair=None):
+    async def get_order_status(self, order_id, pair=None, exchange="bybit"):
         return {"status": "Filled"}
 
-    async def check_balance(self):
+    async def check_balance(self, exchange="bybit"):
         return {"USDT": 1000.0}
 
-    async def get_open_orders(self, pair=None):
+    async def get_open_orders(self, pair=None, exchange="bybit"):
         return [o for o in self.open_orders if pair is None or o["pair"] == pair]
 
-    async def cancel_order(self, order_id, pair=None):
+    async def cancel_order(self, order_id, pair=None, exchange="bybit"):
         self.cancelled.append(order_id)
         self.open_orders = [o for o in self.open_orders if o["id"] != order_id]
         return {"status": "Cancelled"}
@@ -93,7 +93,9 @@ def test_execute_trade_and_monitor(monkeypatch):
 
 def test_order_retry_on_failure():
     class FlakyExchange(DummyExchange):
-        async def place_order(self, pair, price, qty, side="Buy", order_type="Limit"):
+        async def place_order(
+            self, pair, price, qty, side="Buy", order_type="Limit", exchange="bybit"
+        ):
             count = self.attempts.get(pair, 0) + 1
             self.attempts[pair] = count
             if pair == "BTCUSDT" and count == 1:

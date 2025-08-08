@@ -38,7 +38,7 @@ class BackupManager:
     encryption_key: Optional[bytes | str] = None
     _checksums: Dict[str, str] = field(default_factory=dict)
     _last_backup: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
+        default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc)
     )
     _fernet: Optional[Fernet] = field(init=False, default=None)
 
