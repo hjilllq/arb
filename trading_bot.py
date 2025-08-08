@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Awaitable, Optional, cast
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
@@ -125,112 +125,120 @@ class TradingBot:
         raise RuntimeError(f"Order {pair} failed after retries")
 
     async def execute_trade(
-        self, spot_pair: str, futures_pair: str, qty: float, exchange: str = "bybit"
-    ) -> Dict[str, Any]:
-        """Исполнить сделку на основе текущего сигнала стратегии."""
-        orders: Dict[str, Any] = {}
-        try:
-            if self.strategy_manager:
-                await self.strategy_manager.evaluate_market(
-                    self.exchange, spot_pair, exchange
-                )
-                strategy = self.strategy_manager.get_active_strategy()
-            else:
-                strategy = self.strategy
-
-            # Получаем решение стратегии и баланс параллельно, чтобы не блокировать
-            decision, balance = await asyncio.gather(
-                strategy.apply_strategy(self.exchange, spot_pair, futures_pair),
-                self.exchange.check_balance(exchange),
+    self, spot_pair: str, futures_pair: str, qty: float, exchange: str = "bybit"
+) -> Dict[str, Any]:
+    """Исполнить сделку на основе текущего сигнала стратегии."""
+    orders: Dict[str, Any] = {}
+    try:
+        # 1) Получаем стратегию
+        active_strategy: Optional[ArbitrageStrategy]
+        if self.strategy_manager:
+            await self.strategy_manager.evaluate_market(
+                self.exchange, spot_pair, exchange
             )
+            active_strategy = self.strategy_manager.get_active_strategy()
+        else:
+            active_strategy = self.strategy
 
-            price = decision["spot_price"]
-            self.price_history.append(price)
-            if len(self.price_history) > 100:
-                self.price_history.pop(0)
+        if active_strategy is None:
+            raise RuntimeError("Strategy is not configured")
 
+        # 2) Параллельно: решение стратегии и баланс
+        decision, balance = await asyncio.gather(
+            active_strategy.apply_strategy(self.exchange, spot_pair, futures_pair),
+            self.exchange.check_balance(exchange),
+        )
+
+        price = decision["spot_price"]
+        self.price_history.append(price)
+        if len(self.price_history) > 100:
+            self.price_history.pop(0)
+
+        # 3) Риск-менеджмент
+        if self.risk_manager:
+            vol = self.risk_manager.monitor_volatility(price)
+            if self.risk_manager.trading_paused:
+                return {}
+            strategy_name = getattr(active_strategy, "name", None)
+            qty = self.risk_manager.adjust_position_size(qty, strategy_name, vol)
+
+            open_pos = (
+                len(self.position_manager.positions)
+                if self.position_manager
+                else 0
+            )
+            if not self.risk_manager.check_risk_limits(qty, open_positions=open_pos):
+                return {}
+
+            self.risk_manager.update_balance(balance.get("USDT", 0.0))
+            if self.risk_manager.trading_paused:
+                return {}
+
+        # 4) Проверка средств
+        cost = decision["spot_price"] * qty
+        if balance.get("USDT", 0.0) < cost:
+            handle_error("Insufficient balance", ValueError("low balance"))
+            return {}
+
+        # 5) Асинхронные задачи: корректные типы
+        awaitables: List[Awaitable[Any]] = []
+        anomalies_task: Optional[Awaitable[List[int]]] = None
+
+        if len(self.price_history) >= 5:
+            anomalies_task = self._detect_anomalies_async()
+            awaitables.append(anomalies_task)
+
+        awaitables.append(self._cancel_open_orders(spot_pair, exchange))
+        awaitables.append(self._cancel_open_orders(futures_pair, exchange))
+
+        results = await asyncio.gather(*awaitables)
+        anomalies: List[int] = []
+        if anomalies_task is not None:
+            anomalies = cast(List[int], results[0])
+
+        if anomalies and anomalies[-1] == len(self.price_history) - 1:
+            log_event("PRICE ANOMALY DETECTED, SKIP TRADE")
             if self.risk_manager:
-                vol = self.risk_manager.monitor_volatility(price)
-                if self.risk_manager.trading_paused:
-                    return {}
-                strategy_name = getattr(strategy, "name", None)
-                qty = self.risk_manager.adjust_position_size(
-                    qty, strategy_name, vol
-                )
-                open_pos = (
-                    len(self.position_manager.positions)
-                    if self.position_manager
-                    else 0
-                )
-                if not self.risk_manager.check_risk_limits(qty, open_positions=open_pos):
-                    return {}
-                if self.risk_manager.trading_paused:
-                    return {}
-                self.risk_manager.update_balance(balance.get("USDT", 0.0))
-                if self.risk_manager.trading_paused:
-                    return {}
+                self.risk_manager.pause_trading_if_risk("price anomaly")
+            return {}
 
-            cost = decision["spot_price"] * qty
-            if balance.get("USDT", 0.0) < cost:
-                handle_error("Insufficient balance", ValueError("low balance"))
-                return {}
-
-            tasks = []
-            anomalies: List[int] = []
-            if len(self.price_history) >= 5:
-                tasks.append(self._detect_anomalies_async())
-            tasks.extend(
-                [
-                    self._cancel_open_orders(spot_pair, exchange),
-                    self._cancel_open_orders(futures_pair, exchange),
-                ]
+        # 6) Ордеры
+        signal = decision["signal"]
+        if signal == 1:
+            spot_coro = self._place_with_retry(
+                spot_pair, decision["spot_price"], qty, "Buy", exchange
             )
-            results = await asyncio.gather(*tasks)
-            if len(self.price_history) >= 5:
-                anomalies = results[0]
-            if anomalies and anomalies[-1] == len(self.price_history) - 1:
-                log_event("PRICE ANOMALY DETECTED, SKIP TRADE")
-                if self.risk_manager:
-                    self.risk_manager.pause_trading_if_risk("price anomaly")
-                return {}
+            fut_coro = self._place_with_retry(
+                futures_pair, decision["futures_price"], qty, "Sell", exchange
+            )
+            orders["spot"], orders["futures"] = await asyncio.gather(spot_coro, fut_coro)
 
-            signal = decision["signal"]
-            if signal == 1:
-                spot_coro = self._place_with_retry(
-                    spot_pair, decision["spot_price"], qty, "Buy", exchange
-                )
-                fut_coro = self._place_with_retry(
-                    futures_pair, decision["futures_price"], qty, "Sell", exchange
-                )
-                orders["spot"], orders["futures"] = await asyncio.gather(
-                    spot_coro, fut_coro
-                )
-            elif signal == -1:
-                spot_coro = self._place_with_retry(
-                    spot_pair, decision["spot_price"], qty, "Sell", exchange
-                )
-                fut_coro = self._place_with_retry(
-                    futures_pair, decision["futures_price"], qty, "Buy", exchange
-                )
-                orders["spot"], orders["futures"] = await asyncio.gather(
-                    spot_coro, fut_coro
-                )
-            if orders:
-                if self.position_manager:
-                    for order in orders.values():
-                        side = "long" if order["side"].lower() == "buy" else "short"
-                        pair = order["pair"]
-                        existing = self.position_manager.positions.get(pair)
-                        if existing and existing.side != side:
-                            self.position_manager.close_position(pair, order["price"])
-                        self.position_manager.open_position(
-                            pair, order["qty"], order["price"], side
-                        )
-                self.log_trading_activity({"decision": decision, "orders": orders})
-        except Exception as exc:
-            handle_error("Trade execution failed", exc)
-        return orders
+        elif signal == -1:
+            spot_coro = self._place_with_retry(
+                spot_pair, decision["spot_price"], qty, "Sell", exchange
+            )
+            fut_coro = self._place_with_retry(
+                futures_pair, decision["futures_price"], qty, "Buy", exchange
+            )
+            orders["spot"], orders["futures"] = await asyncio.gather(spot_coro, fut_coro)
 
+        # 7) Учёт позиций + лог
+        if orders and self.position_manager:
+            for order in orders.values():
+                side = "long" if order["side"].lower() == "buy" else "short"
+                pair = order["pair"]
+                existing = self.position_manager.positions.get(pair)
+                if existing and existing.side != side:
+                    self.position_manager.close_position(pair, order["price"])
+                self.position_manager.open_position(
+                    pair, order["qty"], order["price"], side
+                )
+        if orders:
+            self.log_trading_activity({"decision": decision, "orders": orders})
+    except Exception as exc:
+        handle_error("Trade execution failed", exc)
+    return orders
+    
     async def monitor_bot_health(self, exchange: str = "bybit") -> Dict[str, Any]:
         """Получить и залогировать информацию о состоянии, например баланс."""
         try:
