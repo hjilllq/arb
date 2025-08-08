@@ -1,0 +1,15 @@
+# Основные зависимости для работы системы арбитража
+httpx
+h2
+scikit-learn
+numpy
+psutil
+python-dotenv
+cryptography
+aiosqlite
+pytest
+prometheus-client
+websockets
+openpyxl
+matplotlib
+torch
