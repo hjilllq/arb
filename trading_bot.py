@@ -143,7 +143,12 @@ class TradingBot:
                 qty = self.risk_manager.adjust_position_size(
                     qty, strategy_name, vol
                 )
-                if not self.risk_manager.check_risk_limits(qty):
+                open_pos = (
+                    len(self.position_manager.positions)
+                    if self.position_manager
+                    else 0
+                )
+                if not self.risk_manager.check_risk_limits(qty, open_positions=open_pos):
                     return {}
                 if self.risk_manager.trading_paused:
                     return {}
@@ -154,6 +159,10 @@ class TradingBot:
                 tasks.append(self._detect_anomalies_async())
             results = await asyncio.gather(*tasks)
             balance = results[0]
+            if self.risk_manager:
+                self.risk_manager.update_balance(balance.get("USDT", 0.0))
+                if self.risk_manager.trading_paused:
+                    return {}
             if len(results) > 1:
                 anomalies = results[1]
             if anomalies and anomalies[-1] == len(self.price_history) - 1:

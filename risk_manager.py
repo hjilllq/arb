@@ -24,6 +24,8 @@ class RiskManager:
     max_position_size: float = 1.0
     max_open_positions: int = 5
     max_total_loss: float = 100.0
+    daily_loss_soft_pct: float = 0.0
+    daily_loss_pct: float = 5.0
     profit_alert: float = 0.0
     loss_alert: float = 0.0
     volatility_window: int = 10
@@ -40,6 +42,8 @@ class RiskManager:
     strategy_multipliers: Dict[str, float] = field(default_factory=dict)
     # дополнительный коэффициент безопасности, применяемый при сбоях
     safety_factor: float = 1.0
+    starting_balance: float = 0.0
+    _soft_loss_triggered: bool = False
 
     # ------------------------------------------------------------------
     # работа с конфигурацией
@@ -60,6 +64,8 @@ class RiskManager:
             max_position_size=cfg.max_position_size,
             max_open_positions=cfg.max_open_positions,
             max_total_loss=cfg.max_total_loss,
+            daily_loss_soft_pct=cfg.daily_loss_soft_pct,
+            daily_loss_pct=cfg.daily_loss_pct,
             profit_alert=cfg.profit_alert,
             loss_alert=cfg.loss_alert,
             notifier=notifier,
@@ -71,6 +77,8 @@ class RiskManager:
         self.max_position_size = cfg.max_position_size
         self.max_open_positions = cfg.max_open_positions
         self.max_total_loss = cfg.max_total_loss
+        self.daily_loss_soft_pct = cfg.daily_loss_soft_pct
+        self.daily_loss_pct = cfg.daily_loss_pct
         self.profit_alert = cfg.profit_alert
         self.loss_alert = cfg.loss_alert
 
@@ -189,6 +197,37 @@ class RiskManager:
         if self.cumulative_pnl <= -self.max_total_loss:
             self.pause_trading_if_risk("max total loss exceeded")
         self._check_pnl_alerts()
+
+    # ------------------------------------------------------------------
+    # мониторинг баланса
+    def update_balance(self, balance: float) -> None:
+        """Отслеживать дневной результат и при необходимости снижать риски."""
+
+        if self.starting_balance == 0:
+            self.starting_balance = balance
+            return
+        change_pct = (balance - self.starting_balance) / self.starting_balance * 100
+        if change_pct <= -self.daily_loss_pct:
+            self.pause_trading_if_risk(
+                f"daily loss {abs(change_pct):.2f}% exceeds {self.daily_loss_pct}%"
+            )
+        elif (
+            self.daily_loss_soft_pct
+            and change_pct <= -self.daily_loss_soft_pct
+            and not self._soft_loss_triggered
+        ):
+            self._soft_loss_triggered = True
+            self.set_safety_factor(
+                0.5,
+                f"daily drawdown {abs(change_pct):.2f}% exceeds {self.daily_loss_soft_pct}%",
+            )
+            if self.notifier:
+                self.notifier.send_telegram_notification(
+                    f"Daily loss {abs(change_pct):.2f}% exceeds {self.daily_loss_soft_pct}%"
+                )
+        elif change_pct > -self.daily_loss_soft_pct and self._soft_loss_triggered:
+            self.reset_safety_factor()
+            self._soft_loss_triggered = False
 
     # ------------------------------------------------------------------
     # адаптация правил

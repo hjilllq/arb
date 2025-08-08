@@ -41,6 +41,20 @@ class DummyExchange:
         return {"status": "Cancelled"}
 
 
+class DummyNotifier:
+    def __init__(self):
+        self.messages: list[str] = []
+        self.email_sender = "test@example.com"
+
+    def send_telegram_notification(self, message: str) -> bool:
+        self.messages.append(message)
+        return True
+
+    def send_email_notification(self, subject: str, body: str, recipients):
+        self.messages.append(body)
+        return True
+
+
 def test_start_and_stop_trading():
     bot = TradingBot(DummyExchange(), ArbitrageStrategy(basis_threshold=1.0))
     bot.start_trading()
@@ -186,3 +200,25 @@ def test_skip_trade_on_low_balance():
     orders = asyncio.run(bot.execute_trade("BTCUSDT", "BTCUSDT-FUT", 1.0))
     assert orders == {}
     assert exchange.orders == []
+
+
+def test_bot_pauses_on_daily_loss():
+    class LossyExchange(DummyExchange):
+        def __init__(self):
+            super().__init__()
+            self.balances = [1000.0, 940.0]
+
+        async def check_balance(self):
+            return {"USDT": self.balances.pop(0)}
+
+    exchange = LossyExchange()
+    notifier = DummyNotifier()
+    risk = RiskManager(daily_loss_soft_pct=0, daily_loss_pct=5, notifier=notifier)
+    bot = TradingBot(exchange, ArbitrageStrategy(basis_threshold=1.0), risk_manager=risk)
+
+    asyncio.run(bot.execute_trade("BTCUSDT", "BTCUSDT-FUT", 0.1))
+    # second trade should trigger pause due to 6% loss
+    result = asyncio.run(bot.execute_trade("BTCUSDT", "BTCUSDT-FUT", 0.1))
+    assert result == {}
+    assert risk.trading_paused
+    assert any("daily loss" in m for m in notifier.messages)

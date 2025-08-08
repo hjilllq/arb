@@ -24,6 +24,8 @@ class Config:
     max_position_size: float
     max_open_positions: int
     max_total_loss: float
+    daily_loss_soft_pct: float
+    daily_loss_pct: float
     profit_alert: float
     loss_alert: float
     trading_pairs: List[Tuple[str, str]]
@@ -125,6 +127,8 @@ def load_config(path: str = ".env") -> Config:
         max_position_size=float(os.getenv("MAX_POSITION_SIZE", "0")),
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "0")),
         max_total_loss=float(os.getenv("MAX_TOTAL_LOSS", "0")),
+        daily_loss_soft_pct=float(os.getenv("DAILY_LOSS_SOFT_PCT", "0")),
+        daily_loss_pct=float(os.getenv("DAILY_LOSS_PCT", "5")),
         profit_alert=float(os.getenv("PROFIT_ALERT", "0")),
         loss_alert=float(os.getenv("LOSS_ALERT", "0")),
         trading_pairs=[
@@ -264,6 +268,12 @@ def validate_thresholds(cfg: Config) -> None:
         raise ValueError("LOSS_ALERT must be >= 0")
     if cfg.profit_alert < 0:
         raise ValueError("PROFIT_ALERT must be >= 0")
+    if cfg.daily_loss_pct <= 0:
+        raise ValueError("DAILY_LOSS_PCT must be greater than 0")
+    if cfg.daily_loss_soft_pct < 0:
+        raise ValueError("DAILY_LOSS_SOFT_PCT must be >= 0")
+    if cfg.daily_loss_soft_pct and cfg.daily_loss_soft_pct >= cfg.daily_loss_pct:
+        raise ValueError("DAILY_LOSS_SOFT_PCT must be less than DAILY_LOSS_PCT")
     if cfg.rsi_period <= 0:
         raise ValueError("RSI_PERIOD must be greater than 0")
     if cfg.rsi_overbought <= cfg.rsi_oversold:

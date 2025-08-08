@@ -87,3 +87,19 @@ def test_safety_factor_adjustment():
     assert rm.calculate_position_size(1000, 0.01, 10) == 0.5
     rm.reset_safety_factor()
     assert rm.calculate_position_size(1000, 0.01, 10) == 1.0
+
+
+def test_daily_loss_monitoring_triggers_actions():
+    notifier = DummyNotifier()
+    rm = RiskManager(
+        daily_loss_soft_pct=2,
+        daily_loss_pct=5,
+        notifier=notifier,
+    )
+    rm.update_balance(1000)
+    rm.update_balance(980)
+    assert rm.safety_factor == 0.5
+    assert notifier.messages
+    rm.update_balance(940)
+    assert rm.trading_paused
+    assert any("daily loss" in m for m in notifier.messages)
