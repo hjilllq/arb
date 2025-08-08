@@ -1,0 +1,14 @@
+[Unit]
+Description=Bybit Arbitrage Bot
+After=network.target
+
+[Service]
+Type=simple
+User=%I
+WorkingDirectory=/path/to/arb
+ExecStart=/usr/bin/python3 -m restart_manager
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
