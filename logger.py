@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping, Optional
 import json
 import logging
-import os
 import sys
 from datetime import datetime
 
