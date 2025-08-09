@@ -10,9 +10,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.12", "3.13"]
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -21,14 +19,25 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.13"
           cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            mypy.ini
 
-      - name: Install dependencies
+      - name: Upgrade pip tooling
+        run: python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install ALL project dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install dev tools (tests, lint, types)
+        run: pip install pytest pytest-asyncio ruff mypy
+
+      - name: Show key package versions
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pytest pytest-asyncio ruff mypy
+          python -V
+          python -c "import torch, sklearn, httpx; print('torch =', getattr(torch, '__version__', '?')); print('sklearn =', getattr(sklearn, '__version__', '?')); print('httpx =', getattr(httpx, '__version__', '?'))"
 
       - name: Lint (ruff)
         run: ruff check .
@@ -37,4 +46,8 @@ jobs:
         run: mypy --config-file mypy.ini .
 
       - name: Run tests
-        run: pytest -q
+        env:
+          # На GitHub-раннере нет GPU; выключаем, чтобы не пыталось инициализировать CUDA.
+          CUDA_VISIBLE_DEVICES: ""
+        run: |
+          pytest -q
