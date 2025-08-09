@@ -1,10 +1,4 @@
-"""Высокоуровневые помощники для управления сделками на Bybit.
-
-Модуль оборачивает :class:`~bybit_api.BybitAPI`, предоставляя удобные
-методы для получения рыночных данных, работы с ордерами и запросов
-информации об аккаунте. Интерфейс намеренно упрощён и служит основой
-для более сложной логики управления торговлей."""
-
+"""Высокоуровневые помощники для управления сделками на Bybit."""
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple, List
@@ -27,7 +21,6 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-# Метрика времени исполнения ордеров
 ORDER_EXECUTION_LATENCY = Histogram(
     "order_execution_latency_seconds",
     "Время выполнения отправки ордеров",
@@ -35,7 +28,7 @@ ORDER_EXECUTION_LATENCY = Histogram(
 
 
 class ExchangeManager:
-    """Обёртка над :class:`BybitAPI` с дополнительными удобными методами."""
+    """Обёртка над BybitAPI с поддержкой мульти-аккаунтов и кэша рынка."""
 
     def __init__(
         self,
@@ -61,25 +54,22 @@ class ExchangeManager:
             else:
                 bybit_list = [BybitAPI(notifier=notifier)]
             self.clients = {"bybit": bybit_list}
-        # по умолчанию используем первую Bybit API
-        self.apis = self.clients.get("bybit", [])
-        self.api = self.apis[0] if self.apis else None
+        self.apis: List[BybitAPI] = self.clients.get("bybit", [])
+        self.api: Optional[BybitAPI] = self.apis[0] if self.apis else None
         self._market_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._watcher_task: Optional[asyncio.Task] = None
         self.trading_params: Dict[str, Any] = {}
 
-    def _get_apis(self, exchange: str) -> List[Any]:
+    def _ensure_api(self, exchange: str) -> BybitAPI:
         apis = self.clients.get(exchange)
         if not apis:
             raise KeyError(f"Unknown exchange {exchange}")
-        return apis
+        api = apis[0]
+        if api is None:
+            raise RuntimeError(f"No API client for exchange {exchange}")
+        return api
 
-    def _get_api(self, exchange: str) -> Any:
-        return self._get_apis(exchange)[0]
-
-    @staticmethod
-    def _extract_available_balance(data: Dict[str, Any]) -> float:
-        """Извлечь доступный баланс USDT из ответа API."""
+    def _extract_available_balance(self, data: Dict[str, Any]) -> float:
         try:
             return float(
                 data.get("result", {})
@@ -90,18 +80,15 @@ class ExchangeManager:
             return 0.0
 
     def sync_trading_parameters(self, params: Dict[str, Any]) -> None:
-        """Сохранить параметры торговли и распространить их между аккаунтами."""
         self.trading_params.update(params)
         logger.debug("Trading parameters synchronized: %s", params)
 
     async def get_spot_data(self, pair: str, exchange: str = "bybit") -> Dict[str, Any]:
-        """Вернуть информацию о тике для спотовой торговой пары."""
-        api = self._get_api(exchange)
+        api = self._ensure_api(exchange)
         return await api.get_spot_data(pair)
 
     async def get_futures_data(self, pair: str, exchange: str = "bybit") -> Dict[str, Any]:
-        """Вернуть информацию о тике для фьючерсной торговой пары."""
-        api = self._get_api(exchange)
+        api = self._ensure_api(exchange)
         return await api.get_futures_data(pair)
 
     async def place_order(
@@ -113,94 +100,66 @@ class ExchangeManager:
         order_type: str = "Limit",
         exchange: str = "bybit",
     ) -> Any:
-        """Отправить ордер, распределяя объём между аккаунтами."""
         start = time.perf_counter()
-        if exchange != "bybit":
-            api = self._get_api(exchange)
-            result = await api.place_order(pair, price, qty, side)
+        api = self._ensure_api(exchange)
+        if exchange != "bybit" or len(self.apis) <= 1:
+            result = await api.place_order(pair, price, qty, side, order_type)
             ORDER_EXECUTION_LATENCY.observe(time.perf_counter() - start)
             return result
-        if len(self.apis) == 1:
-            result = await self.api.place_order(pair, price, qty, side, order_type)
-            ORDER_EXECUTION_LATENCY.observe(time.perf_counter() - start)
-            return result
-        balances = await asyncio.gather(*(api.check_balance() for api in self.apis))
+
+        balances = await asyncio.gather(*(a.check_balance() for a in self.apis))
         amounts = [self._extract_available_balance(b) for b in balances]
-        total = sum(amounts) or 1
+        total = sum(amounts) or 1.0
         tasks = []
-        for api, bal in zip(self.apis, amounts):
+        for a, bal in zip(self.apis, amounts):
             share = qty * bal / total
-            if share <= 0:
-                continue
-            tasks.append(api.place_order(pair, price, share, side, order_type))
+            if share > 0:
+                tasks.append(a.place_order(pair, price, share, side, order_type))
         result = await asyncio.gather(*tasks)
         ORDER_EXECUTION_LATENCY.observe(time.perf_counter() - start)
         return result
 
     async def check_balance(self, exchange: str = "bybit") -> Dict[str, Any]:
-        """Суммарный баланс всех аккаунтов."""
-        if exchange != "bybit":
-            api = self._get_api(exchange)
+        api = self._ensure_api(exchange)
+        if exchange != "bybit" or len(self.apis) <= 1:
             data = await api.check_balance()
             return {"USDT": self._extract_available_balance(data)}
-        if len(self.apis) == 1:
-            data = await self.api.check_balance()
-            return {"USDT": self._extract_available_balance(data)}
-        balances = await asyncio.gather(*(api.check_balance() for api in self.apis))
+        balances = await asyncio.gather(*(a.check_balance() for a in self.apis))
         amounts = [self._extract_available_balance(b) for b in balances]
         return {"USDT": sum(amounts), "accounts": amounts}
 
-    async def get_open_orders(
-        self, pair: Optional[str] = None, exchange: str = "bybit"
-    ) -> Dict[str, Any]:
-        """Получить текущие открытые ордера."""
-        api = self._get_api(exchange)
+    async def get_open_orders(self, pair: Optional[str] = None, exchange: str = "bybit") -> Dict[str, Any]:
+        api = self._ensure_api(exchange)
         return await api.get_open_orders(pair)
 
-    async def get_order_status(
-        self, order_id: str, pair: Optional[str] = None, exchange: str = "bybit"
-    ) -> Dict[str, Any]:
-        """Вернуть текущее состояние ордера."""
-        api = self._get_api(exchange)
+    async def get_order_status(self, order_id: str, pair: Optional[str] = None, exchange: str = "bybit") -> Dict[str, Any]:
+        api = self._ensure_api(exchange)
         return await api.get_order_status(order_id, pair)
 
-    async def cancel_order(
-        self, order_id: str, pair: Optional[str] = None, exchange: str = "bybit"
-    ) -> Dict[str, Any]:
-        """Отменить существующий ордер."""
-        api = self._get_api(exchange)
+    async def cancel_order(self, order_id: str, pair: Optional[str] = None, exchange: str = "bybit") -> Dict[str, Any]:
+        api = self._ensure_api(exchange)
         return await api.cancel_order(order_id, pair)
 
-    async def get_market_status(
-        self, pair: str, category: str = "linear"
-    ) -> Dict[str, Any]:
-        """Вернуть информацию о статусе торговли для пары *pair*.
-
-        Args:
-            pair: Торговая пара для запроса.
-            category: Категория рынка, например ``"spot"`` или ``"linear"``.
-        """
+    async def get_market_status(self, pair: str, category: str = "linear") -> Dict[str, Any]:
+        """Запрос информации об инструменте через публичный REST v5."""
+        if self.api is None:
+            raise RuntimeError("Bybit API is not initialized")
         for attempt in range(3):
             try:
                 params: Dict[str, Any] = {"category": category, "symbol": pair}
-                resp = await self.api._client.get(
-                    "/v5/market/instruments-info", params=params
-                )
+                resp = await self.api._client.get("/v5/market/instruments-info", params=params)
                 resp.raise_for_status()
                 return resp.json()
             except httpx.HTTPError as exc:
                 await self.api.handle_api_error(exc, attempt)
+        raise RuntimeError("get_market_status: request failed after retries")
 
-    async def update_market_data(
-        self, spot_pair: str, futures_pair: str
-    ) -> Dict[str, Dict[str, Any]]:
-        """Асинхронно получить и сохранить котировки спота и фьючерса."""
-
+    async def update_market_data(self, spot_pair: str, futures_pair: str) -> Dict[str, Dict[str, Any]]:
         try:
             spot_task = self.get_spot_data(spot_pair)
             fut_task = self.get_futures_data(futures_pair)
             spot, futures = await asyncio.gather(spot_task, fut_task)
-        except Exception as exc:  # pragma: no cover - непредвиденная ошибка
+        except Exception as exc:  # pragma: no cover
             handle_error("Failed to update market data", exc, self.notifier)
             raise
         now = time.time()
@@ -208,28 +167,15 @@ class ExchangeManager:
         self._market_cache["futures"] = (now, futures)
         return {"spot": spot, "futures": futures}
 
-    async def get_market_data(
-        self, spot_pair: str, futures_pair: str, max_age: float = 2.0
-    ) -> Dict[str, Dict[str, Any]]:
-        """Вернуть свежие данные рынка, обновляя кэш при необходимости."""
-
+    async def get_market_data(self, spot_pair: str, futures_pair: str, max_age: float = 2.0) -> Dict[str, Dict[str, Any]]:
         now = time.time()
         spot_ts, spot = self._market_cache.get("spot", (0.0, {}))
         fut_ts, futures = self._market_cache.get("futures", (0.0, {}))
-        if (
-            now - spot_ts > max_age
-            or now - fut_ts > max_age
-            or not spot
-            or not futures
-        ):
+        if (now - spot_ts > max_age) or (now - fut_ts > max_age) or not spot or not futures:
             return await self.update_market_data(spot_pair, futures_pair)
         return {"spot": spot, "futures": futures}
 
-    async def start_market_watcher(
-        self, spot_pair: str, futures_pair: str, interval: float = 1.0
-    ) -> None:
-        """Запустить фоновое обновление данных о рынке."""
-
+    async def start_market_watcher(self, spot_pair: str, futures_pair: str, interval: float = 1.0) -> None:
         if self._watcher_task:
             return
 
@@ -237,15 +183,13 @@ class ExchangeManager:
             while True:
                 try:
                     await self.update_market_data(spot_pair, futures_pair)
-                except Exception as exc:  # pragma: no cover - логирование ошибок
+                except Exception as exc:  # pragma: no cover
                     handle_error("Market watcher failed", exc)
                 await asyncio.sleep(interval)
 
         self._watcher_task = asyncio.create_task(_watch())
 
     async def stop_market_watcher(self) -> None:
-        """Остановить фоновое обновление данных о рынке."""
-
         if self._watcher_task:
             self._watcher_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -253,15 +197,10 @@ class ExchangeManager:
             self._watcher_task = None
 
     async def backup_open_orders(self, backup_path: str, pair: Optional[str] = None) -> str:
-        """Сохранить текущие открытые ордера в файл ``backup_path``."""
-
         orders = await self.get_open_orders(pair)
-        await asyncio.to_thread(
-            Path(backup_path).write_text, json.dumps(orders, ensure_ascii=False)
-        )
+        await asyncio.to_thread(Path(backup_path).write_text, json.dumps(orders, ensure_ascii=False))
         return backup_path
 
     async def close(self) -> None:
-        """Закрыть внутренние HTTP-соединения."""
         for api in self.apis:
             await api.close()
