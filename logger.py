@@ -1,155 +1,80 @@
-"""Централизованные инструменты логирования для проекта арбитража.
+"""Централизованное JSON-логирование проекта."""
 
-Модуль использует пакет :mod:`logging` и добавляет поддержку нескольких
-уровней сообщений, запись в отдельный файл с ротацией и опциональное
-шифрование строк логов. Это позволяет безопасно хранить информацию о
-торговых операциях и событиях системы."""
 from __future__ import annotations
 
+from typing import Any, Dict, Mapping, Optional
+import json
 import logging
 import os
-from logging.handlers import RotatingFileHandler
-from typing import Any
+import sys
+from datetime import datetime
 
-from cryptography.fernet import Fernet
-
-SENSITIVE_KEYS = {"api_key", "api_secret", "token", "password"}
-
-
-class EncryptedRotatingFileHandler(RotatingFileHandler):
-    """Обработчик, шифрующий каждую строку перед записью в файл."""
-
-    def __init__(
-        self,
-        filename: str,
-        key: str,
-        max_bytes: int = 1_000_000,
-        backup_count: int = 5,
-    ) -> None:
-        os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
-        self.fernet = Fernet(key.encode() if isinstance(key, str) else key)
-        super().__init__(
-            filename,
-            maxBytes=max_bytes,
-            backupCount=backup_count,
-            encoding="utf-8",
-        )
-
-    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - тонкая работа с IO
-        msg = self.format(record)
-        encrypted = self.fernet.encrypt(msg.encode("utf-8")).decode()
-        self.acquire()
-        try:
-            if self.shouldRollover(record):
-                self.doRollover()
-            stream = self.stream or self._open()
-            stream.write(encrypted + self.terminator)
-            stream.flush()
-        finally:
-            self.release()
+# Ключи, которые нужно маскировать в логах
+SENSITIVE_KEYS = {
+    "api_key", "api_secret", "bybit_api_key", "bybit_api_secret",
+    "token", "password", "secret", "authorization", "fernet_key",
+}
 
 
-def _sanitize(data: Dict[str, Any]) -> Dict[str, Any]:
+def _sanitize(data: Mapping[str, Any]) -> Dict[str, Any]:
     """Скрыть конфиденциальные значения перед логированием."""
-    return {k: ("***" if k.lower() in SENSITIVE_KEYS else v) for k, v in data.items()}
+    out: Dict[str, Any] = {}
+    for k, v in data.items():
+        try:
+            out[k] = "***" if k.lower() in SENSITIVE_KEYS else v
+        except Exception:
+            out[k] = v
+    return out
 
 
-logger = logging.getLogger("arb")
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "level": record.levelname,
+            "module": record.module,
+            "msg": record.getMessage(),
+        }
+        # logging.LoggerAdapter может передавать "extra" в record.__dict__
+        for key in ("trace_id", "order_id"):
+            if key in record.__dict__:
+                payload[key] = record.__dict__[key]
+        return json.dumps(payload, ensure_ascii=False)
 
 
-def configure_logging(
-    level: str = "INFO",
-    logfile: str = "logs/arb.log",
-    key: str | None = None,
-) -> None:
-    """Настроить общий логгер проекта.
+def configure_logging(level: str = "INFO", key: Optional[str] = None) -> None:
+    """Инициализация JSON-логов."""
+    lvl = getattr(logging, level.upper(), logging.INFO)
 
-    Parameters
-    ----------
-    level:
-        Минимальный уровень сообщений (DEBUG, INFO, WARNING, ERROR).
-    logfile:
-        Путь к файлу, куда будут записываться логи.
-    key:
-        Ключ шифрования. Если указан, строки в файле будут зашифрованы
-        с использованием алгоритма Fernet.
-    """
+    root = logging.getLogger()
+    root.setLevel(lvl)
+    root.handlers.clear()
 
-    logger.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_JsonFormatter())
+    root.addHandler(handler)
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(fmt)
-    logger.addHandler(stream_handler)
-
-    if logfile:
-        if key:
-            file_handler = EncryptedRotatingFileHandler(logfile, key)
-        else:
-            os.makedirs(os.path.dirname(logfile) or ".", exist_ok=True)
-            file_handler = RotatingFileHandler(
-                logfile, maxBytes=1_000_000, backupCount=5, encoding="utf-8"
-            )
-        file_handler.setFormatter(fmt)
-        logger.addHandler(file_handler)
-
-    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    # отключим шумные логгеры сторонних пакетов, если нужно
+    for noisy in ("httpx", "asyncio", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def log_event(message: str) -> None:
-    """Записать общее информационное событие.
-
-    Parameters
-    ----------
-    message:
-        Описание события.
-    """
-    logger.info(message)
+def log_event(message: str, **fields: Any) -> None:
+    logging.getLogger(__name__).info(message, extra=_sanitize(fields))
 
 
-def log_error(message: str, error: BaseException | None = None, **ctx: Any) -> None:
-    """Записать ошибку.
-
-    Parameters
-    ----------
-    message:
-        Понятное человеку описание ошибки.
-    exc:
-        Необязательное исключение, детали которого нужно залогировать.
-    """
+def log_error(message: str, exc: Optional[Exception] = None, **fields: Any) -> None:
+    """Лог ошибки. Если exc задан — попадёт стек-трейс."""
+    logger = logging.getLogger(__name__)
     if exc:
-        logger.exception("%s: %s", message, exc)
+        logger.exception("%s: %s", message, exc, extra=_sanitize(fields))
     else:
-        logger.error(message)
+        logger.error(message, extra=_sanitize(fields))
 
 
-def log_warning(message: str) -> None:
-    """Записать предупреждение."""
-    logger.warning(message)
+def log_trade_data(trade: Mapping[str, Any]) -> None:
+    logging.getLogger(__name__).info("trade", extra=_sanitize(dict(trade)))
 
 
-def log_debug(message: str) -> None:
-    """Записать отладочное сообщение."""
-    logger.debug(message)
-
-
-def log_trade_data(trade: Dict[str, Any]) -> None:
-    """Логировать структурированные данные сделки.
-
-    Parameters
-    ----------
-    trade:
-        Словарь с характеристиками сделки, например пара, цена и объём.
-    """
-    logger.info("TRADE DATA: %s", _sanitize(trade))
-
-
-def log_system_health(status: Dict[str, Any]) -> None:
-    """Логировать текущие метрики состояния системы.
-
-    Parameters
-    ----------
-    status:
-        Словарь, где ключ — имя проверки, а значение — её статус (число или логический тип).
-    """
-    logger.info("SYSTEM HEALTH: %s", _sanitize(status))
+def log_system_health(status: Mapping[str, Any]) -> None:
+    logging.getLogger(__name__).info("health", extra=_sanitize(dict(status)))
