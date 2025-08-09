@@ -24,11 +24,17 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             mypy.ini
+            .ruff.toml
 
       - name: Upgrade pip tooling
         run: python -m pip install --upgrade pip setuptools wheel
 
-      - name: Install ALL project dependencies
+      # ВАЖНО: никаких CUDA-пакетов. Если торч прилип из кэша — сносим.
+      - name: Ensure no CUDA torch in env
+        run: |
+          pip uninstall -y torch torchvision torchaudio triton || true
+
+      - name: Install project dependencies
         run: pip install -r requirements.txt
 
       - name: Install dev tools (tests, lint, types)
@@ -37,17 +43,30 @@ jobs:
       - name: Show key package versions
         run: |
           python -V
-          python -c "import torch, sklearn, httpx; print('torch =', getattr(torch, '__version__', '?')); print('sklearn =', getattr(sklearn, '__version__', '?')); print('httpx =', getattr(httpx, '__version__', '?'))"
+          python - <<'PY'
+import importlib
+def ver(name):
+    try:
+        m = importlib.import_module(name)
+        print(f"{name} =", getattr(m, "__version__", "n/a"))
+    except Exception:
+        print(f"{name} = not installed")
+for pkg in ["sklearn","httpx","ruff","mypy","pytest"]:
+    ver(pkg)
+try:
+    import torch
+    print("torch =", getattr(torch, "__version__", "n/a"))
+except Exception:
+    print("torch = not installed")
+PY
 
       - name: Lint (ruff)
-        run: ruff check .
+        run: ruff check . --output-format=github
 
       - name: Type check (mypy)
         run: mypy --config-file mypy.ini .
 
       - name: Run tests
         env:
-          # На GitHub-раннере нет GPU; выключаем, чтобы не пыталось инициализировать CUDA.
-          CUDA_VISIBLE_DEVICES: ""
-        run: |
-          pytest -q
+          CUDA_VISIBLE_DEVICES: ""  # на раннере GPU нет
+        run: pytest -q
