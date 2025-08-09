@@ -1,4 +1,4 @@
-# Основные зависимости для работы системы арбитража
+# Основные зависимости для работы системы арбитража (без GPU-зависимостей)
 httpx
 h2
 scikit-learn
@@ -8,9 +8,7 @@ psutil
 python-dotenv
 cryptography
 aiosqlite
-pytest
 prometheus-client
 websockets
 openpyxl
 matplotlib
-torch
