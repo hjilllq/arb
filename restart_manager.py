@@ -62,7 +62,7 @@ class RestartManager:
             if monitor_task in done and monitor_task.exception():
                 restart = True
                 exc = monitor_task.exception()
-                log_error("Health monitor detected failure", exc)  # type: ignore[arg-type]
+                log_error("Health monitor detected failure", exc if isinstance(exc, Exception) else Exception(str(exc)))
                 if self.notifier:
                     self.notifier.send_telegram_notification(
                         f"Health monitor detected failure: {exc}"
@@ -71,7 +71,7 @@ class RestartManager:
             if main_task in done and main_task.exception():
                 restart = True
                 exc = main_task.exception()
-                log_error("Trading system crashed", exc)
+                log_error("Trading system crashed", exc if isinstance(exc, Exception) else Exception(str(exc)))
                 if self.notifier:
                     self.notifier.send_telegram_notification(
                         f"Trading system crashed: {exc}"
